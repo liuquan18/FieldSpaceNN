@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import pytest
 
 from fieldspacenn.src.modules.flowmatching.mg_flow_matching import MGFlowMatching
 from fieldspacenn.src.modules.flowmatching.mg_sampler import EulerFlowSampler
@@ -71,6 +72,35 @@ def test_training_losses_inject_time_and_return_endpoint_estimate():
     assert torch.allclose(model_output[3], torch.ones_like(model_output[3]))
     assert torch.allclose(pred_x1[3], torch.ones_like(pred_x1[3]))
     assert model.last_emb_groups[0]["DiffusionStepEmbedder"] is times
+
+
+def test_training_losses_support_rectified_mode():
+    flow_matching = MGFlowMatching(interpolation_mode="rectified")
+    model = ConstantVelocityModel(value=1.0)
+    data_groups = [_group(1.0)]
+    noise_groups = [_group(0.0)]
+    times = torch.tensor([0.25, 0.75])
+
+    outputs = flow_matching.training_losses(
+        model,
+        data_groups,
+        times,
+        noise_groups=noise_groups,
+        create_pred_x1=True,
+    )
+
+    target, model_output, pred_x1 = outputs[0]
+    assert torch.allclose(target[3], torch.ones_like(target[3]), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(model_output[3], torch.ones_like(model_output[3]))
+    assert torch.allclose(pred_x1[3], torch.ones_like(pred_x1[3]), atol=1e-6, rtol=1e-6)
+
+
+def test_recitified_alias_and_invalid_mode():
+    flow_matching = MGFlowMatching(interpolation_mode="recitified")
+    assert flow_matching.interpolation_mode == "rectified"
+
+    with pytest.raises(ValueError):
+        MGFlowMatching(interpolation_mode="something_else")
 
 
 def test_training_losses_preserve_known_mask_regions():
@@ -145,3 +175,38 @@ def test_flowmatching_model_and_lightning_wrapper_instantiation(monkeypatch):
     assert model.n_blocks == 2
     assert model.get_time_range(1, inference=True) == (0.5, 1.0)
     assert lightning_model.sampling_steps_per_block == 50
+
+
+def test_select_block_for_time_uses_matching_range(monkeypatch):
+    class TinyTransformer(nn.Module):
+        def __init__(self, mgrids, block_configs, in_zooms, in_features=1, **kwargs):
+            super().__init__()
+            self.in_zooms = in_zooms
+            self.in_features = in_features
+            self.grid_layers = nn.ModuleDict()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, x_zooms_groups=None, **kwargs):
+            return x_zooms_groups
+
+    monkeypatch.setattr(mg_flowmatching_model, "MG_Transformer", TinyTransformer)
+
+    model = MGFlowMatchingModel(
+        n_blocks=4,
+        block_time_ranges=[[0.0, 0.25], [0.25, 0.5], [0.5, 0.75], [0.75, 1.0]],
+        mgrids=[],
+        block_configs={},
+        in_zooms=[3],
+    )
+    lightning_model = LightningMGFlowMatchingModel(
+        model=model,
+        flow_matching=MGFlowMatching(),
+        lr_groups={"default": {"lr": 0.001}},
+        lambda_loss_dict={"zooms": {}},
+    )
+
+    assert lightning_model._select_block_for_time(0.10) == 0
+    assert lightning_model._select_block_for_time(0.26) == 1
+    assert lightning_model._select_block_for_time(0.50) == 1
+    assert lightning_model._select_block_for_time(0.74) == 2
+    assert lightning_model._select_block_for_time(0.90) == 3

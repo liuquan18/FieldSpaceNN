@@ -12,16 +12,34 @@ class MGFlowMatching:
         self,
         time_embed_key: str = "DiffusionStepEmbedder",
         separate_noise_on_zoom: bool = True,
+        interpolation_mode: str = "linear",
+        rectified_time_epsilon: float = 1e-5,
     ) -> None:
         """
         Initialize the flow-matching helper.
 
         :param time_embed_key: Embedding key used to pass continuous flow time.
         :param separate_noise_on_zoom: Whether to sample independent noise per zoom.
+        :param interpolation_mode: Flow objective mode. Supported values are
+            ``"linear"`` (default) and ``"rectified"``.
+        :param rectified_time_epsilon: Lower bound for ``1 - t`` in rectified
+            mode for numerical stability near ``t=1``.
         :return: None.
         """
         self.time_embed_key: str = time_embed_key
         self.separate_noise_on_zoom: bool = separate_noise_on_zoom
+        mode_normalized = str(interpolation_mode).strip().lower()
+        if mode_normalized == "recitified":
+            mode_normalized = "rectified"
+        if mode_normalized not in {"linear", "rectified"}:
+            raise ValueError(
+                "`interpolation_mode` must be one of {'linear', 'rectified'}, "
+                f"got `{interpolation_mode}`."
+            )
+        self.interpolation_mode: str = mode_normalized
+        self.rectified_time_epsilon: float = float(rectified_time_epsilon)
+        if self.rectified_time_epsilon <= 0.0:
+            raise ValueError("`rectified_time_epsilon` must be > 0.")
 
     @staticmethod
     def _expand_time_like(times: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
@@ -141,15 +159,31 @@ class MGFlowMatching:
         self,
         data_zooms: Mapping[int, torch.Tensor],
         noise_zooms: Mapping[int, torch.Tensor],
+        x_t_zooms: Optional[Mapping[int, torch.Tensor]] = None,
+        times: Optional[torch.Tensor] = None,
     ) -> Dict[int, torch.Tensor]:
         """
-        Compute the Gaussian OT target velocity.
+        Compute the target velocity for the configured interpolation mode.
 
         :param data_zooms: Data endpoint ``x_1`` per zoom.
         :param noise_zooms: Noise endpoint ``x_0`` per zoom.
-        :return: Velocity target ``x_1 - x_0`` per zoom.
+        :param x_t_zooms: Optional interpolated state ``x_t`` per zoom.
+        :param times: Optional continuous times of shape ``(b,)``.
+        :return: Velocity target per zoom.
         """
-        return {int(zoom): data_zooms[zoom] - noise_zooms[zoom] for zoom in data_zooms.keys()}
+        if self.interpolation_mode == "linear":
+            return {int(zoom): data_zooms[zoom] - noise_zooms[zoom] for zoom in data_zooms.keys()}
+
+        # Rectified flow with straight interpolation:
+        # v* = (x1 - xt) / (1 - t), equivalent to x1 - x0 for exact arithmetic.
+        if x_t_zooms is None or times is None:
+            return {int(zoom): data_zooms[zoom] - noise_zooms[zoom] for zoom in data_zooms.keys()}
+
+        one_minus_t = (1.0 - times).clamp_min(self.rectified_time_epsilon)
+        return {
+            int(zoom): (data_zooms[zoom] - x_t_zooms[zoom]) / self._expand_time_like(one_minus_t, data_zooms[zoom])
+            for zoom in data_zooms.keys()
+        }
 
     def pred_x1_from_velocity(
         self,
@@ -269,8 +303,11 @@ class MGFlowMatching:
             assert noise_zooms is not None
             adjusted_noise = self.apply_mask_to_noise(gt_zooms, noise_zooms, mask_zooms)
             adjusted_noise_groups.append(adjusted_noise)
-            x_t_groups.append(self.interpolate(gt_zooms, adjusted_noise, times))
-            target_groups.append(self.target_velocity(gt_zooms, adjusted_noise))
+            x_t_zooms = self.interpolate(gt_zooms, adjusted_noise, times)
+            x_t_groups.append(x_t_zooms)
+            target_groups.append(
+                self.target_velocity(gt_zooms, adjusted_noise, x_t_zooms=x_t_zooms, times=times)
+            )
 
         model_output_groups = list(
             self.model_velocity(

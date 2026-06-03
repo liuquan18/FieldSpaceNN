@@ -14,26 +14,24 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         model: Any,
         lr_groups: Mapping[str, Mapping[str, Any]],
         lambda_loss_dict: Mapping[str, Any],
+        data_variables: Optional[Mapping[str, Any]] = None,
         weight_decay: float = 0.0,
         lambda_loss_groups: list = [],
-        n_auteregressive_steps: int = 1,
+        n_autoregressive_steps: int = 1,
         return_all_steps: bool = False,
     ) -> None:
         super().__init__(
             model=model,
             lr_groups=lr_groups,
             lambda_loss_dict=lambda_loss_dict,
+            data_variables=data_variables,
             weight_decay=weight_decay,
             lambda_loss_groups=lambda_loss_groups,
         )
-        if n_auteregressive_steps < 1:
-            raise ValueError("n_auteregressive_steps must be at least 1.")
-        self.n_auteregressive_steps = int(n_auteregressive_steps)
+        if n_autoregressive_steps < 1:
+            raise ValueError("n_autoregressive_steps must be at least 1.")
+        self.n_autoregressive_steps = int(n_autoregressive_steps)
         self.return_all_steps = return_all_steps
-
-    @property
-    def n_autoregressive_steps(self) -> int:
-        return self.n_auteregressive_steps
 
     @staticmethod
     def _extract_forecast_groups(

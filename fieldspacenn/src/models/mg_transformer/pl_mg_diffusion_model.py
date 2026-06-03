@@ -18,6 +18,7 @@ class Lightning_MG_diffusion_transformer(LightningMGModel, LightningProbabilisti
         gaussian_diffusion: MGGaussianDiffusion,
         lr_groups: Mapping[str, Mapping[str, Any]],
         lambda_loss_dict: Mapping[str, float],
+        data_variables: Optional[Mapping[str, Any]] = None,
         weight_decay: float = 0.0,
         sampler: str = "ddpm",
         n_samples: int = 1,
@@ -42,6 +43,7 @@ class Lightning_MG_diffusion_transformer(LightningMGModel, LightningProbabilisti
             model,
             lr_groups,
             lambda_loss_dict,
+            data_variables,
             weight_decay
         )
 
@@ -234,8 +236,22 @@ class Lightning_MG_diffusion_transformer(LightningMGModel, LightningProbabilisti
                 source_p = {zoom: source_p_group[zoom][0:1] for zoom in source_p_group.keys()}
                 target_p = {zoom: target_p_group[zoom][0:1] for zoom in target_p_group.keys()}
                 mask_p = {zoom: mask_p_group[zoom][0:1] for zoom in mask_p_group.keys()} if mask_p_group else None
-                emb_p = {'VariableEmbedder': emb_p_group['VariableEmbedder'][0:1],
-                         'TimeEmbedder': {int(zoom): emb_p_group['TimeEmbedder'][zoom][0:1] for zoom in emb_p_group['TimeEmbedder'].keys()}}
+                emb_p = {
+                    'VariableEmbedder': emb_p_group['VariableEmbedder'][0:1],
+                    'TimeEmbedder': {int(zoom): emb_p_group['TimeEmbedder'][zoom][0:1] for zoom in emb_p_group['TimeEmbedder'].keys()},
+                }
+                if 'variables_sampled' in emb_p_group:
+                    emb_p['variables_sampled'] = emb_p_group['variables_sampled'][0:1]
+                if 'variable_names_sampled' in emb_p_group:
+                    emb_p['variable_names_sampled'] = emb_p_group['variable_names_sampled']
+                if 'depth_values' in emb_p_group:
+                    emb_p['depth_values'] = emb_p_group['depth_values']
+                if 'GroupDepthEmbedder' in emb_p_group:
+                    emb_p['GroupDepthEmbedder'] = emb_p_group['GroupDepthEmbedder']
+                if 'MGEmbedder' in emb_p_group:
+                    emb_p['MGEmbedder'] = emb_p_group['MGEmbedder'][0:1]
+                if 'StaticVariableEmbedder' in emb_p_group:
+                    emb_p['StaticVariableEmbedder'] = emb_p_group['StaticVariableEmbedder']
                 patch_index_zooms_p = {zoom: patch_index_zooms[zoom][0:1] for zoom in patch_index_zooms.keys()}
                 sample_configs_p = merge_sampling_dicts(self.trainer.val_dataloaders.dataset.sampling_zooms_collate or self.trainer.val_dataloaders.dataset.sampling_zooms, patch_index_zooms_p)
                 model_kwargs = {'sample_configs': sample_configs_p}

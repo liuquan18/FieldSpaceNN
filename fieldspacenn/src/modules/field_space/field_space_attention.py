@@ -59,6 +59,7 @@ class FieldSpaceAttentionConfig:
         update: str = 'shift',
         refine_zooms: Dict[int, int] = {},
         separate_mlp_norm: bool = True,
+        mlp_residual_from_attention: bool = False,
         use_variable_emb_layer: bool = True,
         use_variable_layer_norm: bool = True,
         use_variable_qkv: bool = True,
@@ -104,6 +105,8 @@ class FieldSpaceAttentionConfig:
         :param update: Update mode ("shift" or "shift_scale").
         :param refine_zooms: Mapping of zoom refinements.
         :param separate_mlp_norm: Whether to separate MLP norm.
+        :param mlp_residual_from_attention: Whether the MLP residual uses the
+            post-attention tensor instead of the original zoom tensor.
         :param use_variable_emb_layer: Whether embedding layers use variable-specific parameters.
         :param use_variable_layer_norm: Whether embedding-layer layer norms use variable-specific affine params.
         :param use_variable_qkv: Whether Q/KV/attention projection layers use variable-specific parameters.
@@ -146,6 +149,7 @@ class FieldSpaceAttentionConfig:
         self.update: str
         self.refine_zooms: Dict[int, int]
         self.separate_mlp_norm: bool
+        self.mlp_residual_from_attention: bool
         self.use_variable_emb_layer: bool
         self.use_variable_layer_norm: bool
         self.use_variable_qkv: bool
@@ -208,6 +212,7 @@ class FieldSpaceAttentionModule(nn.Module):
         dropout: float = 0,
         update: str = 'shift',
         separate_mlp_norm: bool = True,
+        mlp_residual_from_attention: bool = False,
         use_variable_emb_layer: bool = True,
         use_variable_layer_norm: bool = True,
         use_variable_qkv: bool = True,
@@ -263,6 +268,8 @@ class FieldSpaceAttentionModule(nn.Module):
         :param dropout: Dropout rate.
         :param update: Update mode ("shift" or "shift_scale").
         :param separate_mlp_norm: Whether to separate MLP norm.
+        :param mlp_residual_from_attention: Whether the MLP residual uses the
+            post-attention tensor instead of the original zoom tensor.
         :param use_variable_emb_layer: Whether embedding layers use variable-specific parameters.
         :param use_variable_layer_norm: Whether embedding-layer layer norms use variable-specific affine params.
         :param use_variable_qkv: Whether Q/KV/attention projection layers use variable-specific parameters.
@@ -392,6 +399,7 @@ class FieldSpaceAttentionModule(nn.Module):
                         emb_aggregation=emb_aggregation,
                         update=update,
                         separate_mlp_norm=separate_mlp_norm,
+                        mlp_residual_from_attention=mlp_residual_from_attention,
                         use_variable_emb_layer=use_variable_emb_layer,
                         use_variable_layer_norm=use_variable_layer_norm,
                         use_variable_qkv=use_variable_qkv,
@@ -593,6 +601,7 @@ class FieldSpaceAttentionBlock(nn.Module):
         update: str = 'shift',
         layer_norm: bool = True,
         separate_mlp_norm: bool = False,
+        mlp_residual_from_attention: bool = False,
         use_variable_emb_layer: bool = True,
         use_variable_layer_norm: bool = True,
         use_variable_qkv: bool = True,
@@ -639,6 +648,8 @@ class FieldSpaceAttentionBlock(nn.Module):
         :param update: Update mode ("shift" or "shift_scale").
         :param layer_norm: Whether to apply layer norm in embedding layers.
         :param separate_mlp_norm: Whether to separate MLP norm.
+        :param mlp_residual_from_attention: Whether the MLP residual uses the
+            post-attention tensor instead of the original zoom tensor.
         :param use_variable_emb_layer: Whether embedding layers use variable-specific parameters.
         :param use_variable_layer_norm: Whether embedding-layer layer norms use variable-specific affine params.
         :param use_variable_qkv: Whether Q/KV/attention projection layers use variable-specific parameters.
@@ -770,6 +781,7 @@ class FieldSpaceAttentionBlock(nn.Module):
         token_size_in_kv_overlap = [token_len_time + 2 * token_overlap_time, sum(self.n_in_features_zooms_kv.values()), token_len_depth + 2 * token_overlap_depth, in_features]
 
         self.separate_mlp_norm: bool = separate_mlp_norm
+        self.mlp_residual_from_attention: bool = mlp_residual_from_attention
 
         # Optional embedding path for conditioning.
         input_zoom_field = embed_confs.get("input_zoom", min(q_zooms))
@@ -1187,6 +1199,20 @@ class FieldSpaceAttentionBlock(nn.Module):
             # Simple residual update when only shift is used.
             x = (1 + gamma_res_att) * x_base + gamma_att * self.dropout_att(att_out)
 
+        residual_bases = None
+        if self.mlp_residual_from_attention:
+            residual_bases = {}
+            x_residual_splits = x.split(tuple(self.n_out_features_update.values()), dim=-3)
+            for k, (zoom, n) in enumerate(self.n_out_features_update.items()):
+                residual_base = rearrange(x_residual_splits[k], self.pattern_tokens_reverse, n=n)
+                residual_bases[zoom] = insert_matching_time_patch(
+                    x_zooms[zoom],
+                    residual_base,
+                    zoom,
+                    max(self.q_zooms),
+                    sample_configs,
+                )
+
         if self.separate_mlp_norm and self.emb_layer_mlp is not None:
             x = self.emb_layer_mlp(x, emb=emb_tokenized, sample_configs=sample_configs)
 
@@ -1201,16 +1227,17 @@ class FieldSpaceAttentionBlock(nn.Module):
                 x_out = rearrange(x[k], self.pattern_tokens_reverse, n=n)
                 gamma_res_mlp = self._get_mlp_gamma(self.gamma_res_mlp, k, emb_tokenized)
                 gamma_mlp = self._get_mlp_gamma(self.gamma_mlp, k, emb_tokenized)
+                residual_base = residual_bases[zoom] if residual_bases is not None else x_zooms[zoom]
 
                 if self.scale_shift:
                     scale, shift = x_out.chunk(2, dim=-1)
                     shift = insert_matching_time_patch(x_zooms[zoom], shift, zoom, max(self.q_zooms), sample_configs)
                     scale = insert_matching_time_patch(x_zooms[zoom], scale, zoom, max(self.q_zooms), sample_configs)
-                    x_zooms[zoom] = x_zooms[zoom] * (1 + gamma_res_mlp * scale) + gamma_mlp * shift
+                    x_zooms[zoom] = residual_base * (1 + gamma_res_mlp * scale) + gamma_mlp * shift
                 else:
                     x_out = insert_matching_time_patch(x_zooms[zoom], x_out, zoom, max(self.q_zooms), sample_configs)
                     # Simple residual update at each zoom.
-                    x_zooms[zoom] = (1 + gamma_res_mlp) * x_zooms[zoom] + gamma_mlp * x_out
+                    x_zooms[zoom] = (1 + gamma_res_mlp) * residual_base + gamma_mlp * x_out
 
         return x_zooms
 
@@ -1230,9 +1257,21 @@ class FieldSpaceAttentionBlock(nn.Module):
         :param sample_configs: Sampling configuration per zoom.
         :return: Updated zoom tensors shaped like ``(b, v, t, n, d, f)``.
         """
-        x_base, q, kv = self.create_QKV(x_zooms, emb=emb, sample_configs=sample_configs)
-        att_out = self.attend(q, kv, mask=mask_zooms[self.grid_layer_field.zoom], sample_configs=sample_configs)
-        return self.forward_mlp(x_zooms, x_base, att_out, emb=emb, sample_configs=sample_configs)
+        x_base, q, K, V, mask, shape = self.create_QKV(
+            x_zooms,
+            emb=emb,
+            sample_configs=sample_configs,
+            mask_zooms=mask_zooms,
+        )
+        att_out = safe_scaled_dot_product_attention(q, K, V, mask=mask)
+        return self.forward_mlp(
+            x_zooms,
+            x_base,
+            att_out,
+            shape,
+            emb=emb,
+            sample_configs=sample_configs,
+        )
 
     
 def invert_dict(d: Dict[int, int]) -> Dict[int, int]:

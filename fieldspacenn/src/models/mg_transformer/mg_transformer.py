@@ -1,12 +1,11 @@
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
-from ...utils.helpers import check_get
 from ...modules.field_space.field_space_base import DiffDecoder
-from ...modules.grids.grid_utils import decode_zooms
-from .mg_base_model import MG_base_model, create_encoder_decoder_block, create_missing_zooms, defaults
+from .mg_base_model import MG_base_model, create_encoder_decoder_block, create_missing_zooms
+from .residual_blocks import ResidualApplyBlock, ResidualSaveBlock
 
 class MG_Transformer(MG_base_model):
     """
@@ -36,31 +35,26 @@ class MG_Transformer(MG_base_model):
         super().__init__(mgrids)
 
         self.in_zooms: Sequence[int] = in_zooms
-        self.in_features: int = in_features 
-       
+        self.in_features: int = in_features
 
         self.Blocks: nn.ModuleDict = nn.ModuleDict()
 
-        in_features = [in_features]*len(in_zooms)
-
+        in_features = [in_features] * len(in_zooms)
 
         for block_key, block_conf in block_configs.items():
             assert isinstance(block_key, str), "block keys should be strings"
             block = create_encoder_decoder_block(block_conf, in_zooms, in_features, n_groups_variables, self.grid_layers)
 
-            self.Blocks[block_key] = block     
+            self.Blocks[block_key] = block
 
             in_features = block.out_features
-            in_zooms = block.out_zooms        
+            in_zooms = block.out_zooms
 
-        block.out_features = [in_features[0]]
-        
-        self.masked_residual: bool = check_get([kwargs, defaults], "masked_residual")
-        self.learn_residual: bool = check_get([kwargs, defaults], "learn_residual") if not self.masked_residual else True
+        if self.Blocks:
+            list(self.Blocks.values())[-1].out_features = [in_features[0]]
 
         self.decoder: DiffDecoder = DiffDecoder()
 
-        
     def decode(
         self,
         x_zooms: Dict[int, torch.Tensor],
@@ -105,29 +99,34 @@ class MG_Transformer(MG_base_model):
         x_zooms_groups, mask_zooms_groups, emb_groups, sample_configs = create_missing_zooms(
             x_zooms_groups, self.in_zooms, mask_zooms_groups, emb_groups, sample_configs=sample_configs)
 
-
-        x_zooms_groups_res = None
-        # Keep a residual copy for optional additive updates.
-        x_zooms_groups_res = [x.copy() for x in x_zooms_groups]
-
-        mask_zooms_groups_res = None
-        if self.masked_residual:
-            mask_zooms_groups_res = [
-                mask.copy() if mask is not None else None for mask in mask_zooms_groups
-            ]
+        saved_residual_groups: Optional[List[Dict[int, torch.Tensor]]] = None
+        saved_mask_groups: Optional[List[Optional[Dict[int, torch.Tensor]]]] = None
 
         for block in self.Blocks.values():
+            if isinstance(block, ResidualSaveBlock):
+                saved_residual_groups = self.clone_zoom_groups(x_zooms_groups)
+                saved_mask_groups = self.clone_mask_groups(mask_zooms_groups)
+                continue
+
+            if isinstance(block, ResidualApplyBlock):
+                x_zooms_groups = self.apply_saved_residuals(
+                    x_zooms_groups=x_zooms_groups,
+                    saved_residual_groups=saved_residual_groups,
+                    mask_zooms_groups=mask_zooms_groups,
+                    saved_mask_groups=saved_mask_groups,
+                    block=block,
+                )
+                if block.clear_after_apply:
+                    saved_residual_groups = None
+                    saved_mask_groups = None
+                continue
+
             x_zooms_groups = block(
                 x_zooms_groups,
                 sample_configs=sample_configs,
                 mask_groups=mask_zooms_groups,
                 emb_groups=emb_groups,
             )
-
-        for i, x_zooms in enumerate(x_zooms_groups):
-
-            x_res = x_zooms_groups_res[i] if self.learn_residual else None
-            x_zooms_groups[i] = self.apply_residuals(x_zooms, x_res, mask_zooms_groups, mask_zooms_groups_res, sample_configs)
 
         if out_zoom is not None:
             for i, x_zooms in enumerate(x_zooms_groups):
@@ -139,49 +138,114 @@ class MG_Transformer(MG_base_model):
 
         return x_zooms_groups
 
-
-    def apply_residuals(
+    def clone_zoom_groups(
         self,
-        x_zooms: Dict[int, torch.Tensor],
-        x_zooms_res: Optional[Dict[int, torch.Tensor]],
-        mask_zooms: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]],
-        mask_res: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]],
-        sample_configs: Mapping[int, Any],
-    ) -> Dict[int, torch.Tensor]:
+        x_zooms_groups: Sequence[Dict[int, torch.Tensor]],
+    ) -> List[Dict[int, torch.Tensor]]:
         """
-        Apply residual connections to the decoded zoom tensors.
+        Clone a sequence of zoom groups.
 
-        :param x_zooms: Current zoom mapping to update with tensors of shape
-            ``(b, v, t, n, d, f)``.
-        :param x_zooms_res: Residual zoom mapping (optional) with tensors of shape
-            ``(b, v, t, n, d, f)``.
-        :param mask_zooms: Mask mappings aligned with current outputs.
-        :param mask_res: Mask mappings aligned with residuals.
-        :param sample_configs: Sampling configuration dictionary per zoom.
-        :return: Updated zoom mapping.
+        :param x_zooms_groups: Sequence of zoom-to-tensor mappings.
+        :return: Cloned zoom mappings.
         """
-        if not x_zooms:
-            return x_zooms
+        return [
+            {zoom: tensor.clone() for zoom, tensor in x_zooms.items()}
+            for x_zooms in x_zooms_groups
+        ]
 
-        if mask_res is None:
-            mask_res = mask_zooms
+    def clone_mask_groups(
+        self,
+        mask_zooms_groups: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]],
+    ) -> Optional[List[Optional[Dict[int, torch.Tensor]]]]:
+        """
+        Clone a sequence of mask groups.
 
-        if self.learn_residual:
-            for i, x_zooms_res in enumerate(x_zooms_res):
-                if len(x_zooms_res) == 1 :
-                    x_zooms_res = decode_zooms(
-                        x_zooms_res,
-                        sample_configs=sample_configs,
-                        out_zoom=list(x_zooms_res.keys())[0],
+        :param mask_zooms_groups: Optional sequence of zoom-to-mask mappings.
+        :return: Cloned mask mappings.
+        """
+        if mask_zooms_groups is None:
+            return None
+
+        return [
+            None if mask_zooms is None else {zoom: mask.clone() for zoom, mask in mask_zooms.items()}
+            for mask_zooms in mask_zooms_groups
+        ]
+
+    def apply_saved_residuals(
+        self,
+        x_zooms_groups: Sequence[Dict[int, torch.Tensor]],
+        saved_residual_groups: Optional[Sequence[Dict[int, torch.Tensor]]],
+        mask_zooms_groups: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]],
+        saved_mask_groups: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]],
+        block: ResidualApplyBlock,
+    ) -> List[Dict[int, torch.Tensor]]:
+        """
+        Apply a saved top-level residual state to the current zoom groups.
+
+        :param x_zooms_groups: Current zoom mappings.
+        :param saved_residual_groups: Previously saved zoom mappings.
+        :param mask_zooms_groups: Current mask mappings.
+        :param saved_mask_groups: Saved mask mappings aligned with the residual state.
+        :param block: Residual apply marker containing mode settings.
+        :return: Updated zoom mappings.
+        """
+        if saved_residual_groups is None:
+            raise ValueError("ResidualApplyBlock requires a saved residual state.")
+
+        if len(x_zooms_groups) != len(saved_residual_groups):
+            raise ValueError(
+                "ResidualApplyBlock requires the same number of groups in the saved and current states."
+            )
+
+        if block.mode not in {"add", "masked"}:
+            raise ValueError(f"Unsupported residual mode `{block.mode}`.")
+
+        x_zooms_groups_out = list(x_zooms_groups)
+        for group_idx, (x_zooms, saved_zooms) in enumerate(zip(x_zooms_groups_out, saved_residual_groups)):
+            current_zooms = set(x_zooms.keys())
+            saved_zoom_keys = set(saved_zooms.keys())
+            if current_zooms != saved_zoom_keys:
+                raise ValueError(
+                    f"ResidualApplyBlock requires matching zoom keys for group {group_idx}: "
+                    f"{sorted(saved_zoom_keys)} != {sorted(current_zooms)}."
+                )
+
+            current_masks = None if mask_zooms_groups is None else mask_zooms_groups[group_idx]
+            saved_masks = None if saved_mask_groups is None else saved_mask_groups[group_idx]
+            if block.mode == "masked" and (current_masks is None or saved_masks is None):
+                raise ValueError(
+                    f"ResidualApplyBlock in masked mode requires masks for group {group_idx}."
+                )
+
+            for zoom in x_zooms.keys():
+                current = x_zooms[zoom]
+                saved = saved_zooms[zoom]
+                if current.shape != saved.shape:
+                    raise ValueError(
+                        f"ResidualApplyBlock requires matching tensor shapes for group {group_idx}, "
+                        f"zoom {zoom}: {tuple(saved.shape)} != {tuple(current.shape)}."
                     )
 
-        elif self.learn_residual:
-            for zoom in x_zooms.keys():
-                if not self.masked_residual or mask_zooms is None:
-                    x_zooms[zoom] = x_zooms_res[zoom] + x_zooms[zoom]
-                elif mask_zooms[zoom].dtype == torch.bool:
-                    x_zooms[zoom] = (1 - 1. * mask_zooms[zoom]) * x_zooms_res[zoom] + (mask_zooms[zoom]) * x_zooms[zoom]
-                else:
-                    x_zooms[zoom] = mask_zooms[zoom] * x_zooms_res[zoom] + (1 - mask_res[zoom]) * x_zooms[zoom]
+                if block.mode == "add":
+                    x_zooms[zoom] = saved + current
+                    continue
 
-        return x_zooms
+                if zoom not in current_masks or zoom not in saved_masks:
+                    raise ValueError(
+                        f"ResidualApplyBlock in masked mode requires masks for group {group_idx}, zoom {zoom}."
+                    )
+
+                mask = current_masks[zoom]
+                saved_mask = saved_masks[zoom]
+                if mask.shape != current.shape or saved_mask.shape != saved.shape:
+                    raise ValueError(
+                        f"ResidualApplyBlock in masked mode requires mask shapes to match tensor shapes "
+                        f"for group {group_idx}, zoom {zoom}."
+                    )
+
+                if mask.dtype == torch.bool:
+                    x_zooms[zoom] = torch.where(mask, current, saved)
+                else:
+                    x_zooms[zoom] = saved * (1 - mask) + current * mask
+
+        return x_zooms_groups_out

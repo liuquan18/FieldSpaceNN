@@ -14,6 +14,7 @@ class LightningMGAutoEncoderModel(LightningMGModel, LightningProbabilisticModel)
         model: Any,
         lr_groups: Mapping[str, Mapping[str, Any]],
         lambda_loss_dict: Dict[str, float],
+        data_variables: Optional[Mapping[str, Any]] = None,
         kl_weight: float = 1e-6,
         weight_decay: float = 0.0,
         n_samples: int = 1,
@@ -37,6 +38,7 @@ class LightningMGAutoEncoderModel(LightningMGModel, LightningProbabilisticModel)
             model,  # Main VAE model
             lr_groups,
             lambda_loss_dict=lambda_loss_dict,
+            data_variables=data_variables,
             weight_decay=weight_decay
         )
 

@@ -152,6 +152,7 @@ class BaseDataset(Dataset):
         variables_as_features: bool = False,
         load_n_samples_time: int = 1,
         target_time_shift: int = 0,
+        overwrite_depths: Optional[Sequence[float]] = None,
     ) -> None:
         """
         Initialize the dataset with sampling, masking, and normalization settings.
@@ -177,6 +178,8 @@ class BaseDataset(Dataset):
         :param variables_as_features: Whether to treat variables as features.
         :param load_n_samples_time: Number of time samples stacked as batch.
         :param target_time_shift: Shift applied to target sample centers relative to source centers.
+        :param overwrite_depths: Optional replacement values for the vertical ``level``
+            coordinate. Applied only when the loaded variables expose a ``level`` dimension.
         :return: None.
         """
         super(BaseDataset, self).__init__()
@@ -211,6 +214,11 @@ class BaseDataset(Dataset):
 
         self.load_n_samples_time: int = load_n_samples_time
         self.target_time_shift: int = target_time_shift
+        self.overwrite_depths: Optional[torch.Tensor] = (
+            torch.as_tensor(overwrite_depths, dtype=torch.float32)
+            if overwrite_depths is not None
+            else None
+        )
 
         self.mask_ts_mode: str = mask_ts_mode
         self.p_dropout_all_zooms: Dict[int, float] = dict(
@@ -492,7 +500,7 @@ class BaseDataset(Dataset):
         mapping_zoom: int,
         zoom: int,
         drop_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Extract data, time values, and masks for a given patch.
 
@@ -503,10 +511,11 @@ class BaseDataset(Dataset):
         :param mapping_zoom: Zoom level of the mapping source.
         :param zoom: Zoom level of the requested data.
         :param drop_mask: Optional dropout mask tensor of shape ``(v, t, n)`` or ``(1, v, t, n)``.
-        :return: Tuple ``(data_g, data_time, drop_mask)`` where ``data_g`` is a tensor of
+        :return: Tuple ``(data_g, drop_mask, depth_values)`` where ``data_g`` is a tensor of
             shape ``(v, t, n, d, f)`` (matching the ``(b, v, t, n, d, f)`` base shape with
-            ``b`` handled by the caller), ``data_time`` is a tensor of shape ``(t,)``,
-            and ``drop_mask`` is a tensor of shape ``(v, t, n, d, 1)``.
+            ``b`` handled by the caller), ``drop_mask`` is a tensor of shape
+            ``(v, t, n, d, 1)``, and ``depth_values`` is the sampled level coordinate
+            for the group when present.
         """
         # Fetch raw patch indices
         drop_mask_ = drop_mask.clone() if drop_mask is not None else None
@@ -517,6 +526,7 @@ class BaseDataset(Dataset):
         patch_dim = patch_dim_candidates[0] if patch_dim_candidates else None
 
         data_g = []
+        depth_values = None
         for grid_type, variables_grid_type in self.grid_types_vars.items():
             variables = [var for var in variables_sample if var in variables_grid_type]
             if not variables:
@@ -552,6 +562,8 @@ class BaseDataset(Dataset):
 
             if 'level' not in ds_variables.dims:
                 data_g = data_g.unsqueeze(dim=2)
+            else:
+                depth_values = self._resolve_depth_values(ds_variables["level"].values)
 
             data_g = data_g.transpose(2,3)
 
@@ -580,7 +592,20 @@ class BaseDataset(Dataset):
         if mask is not None:
             mask = torch.logical_not(mask[...,[0]]) if mask.dtype==torch.bool else mask[...,[0]]
 
-        return data_g, mask
+        return data_g, mask, depth_values
+
+    def _resolve_depth_values(self, level_values: Any) -> torch.Tensor:
+        depth_values = torch.as_tensor(level_values, dtype=torch.float32)
+        if self.overwrite_depths is None:
+            return depth_values
+
+        overwrite_depths = self.overwrite_depths.to(dtype=depth_values.dtype)
+        if overwrite_depths.numel() != depth_values.numel():
+            raise ValueError(
+                f"`overwrite_depths` has length {overwrite_depths.numel()}, but dataset level "
+                f"coordinate has length {depth_values.numel()}."
+            )
+        return overwrite_depths
 
    #def get_masks_zooms(self, grid_type):
 
@@ -817,6 +842,7 @@ class BaseDataset(Dataset):
         target_zooms_groups = [{} for _ in group_keys]
         data_time_zooms = {}
         mask_mapping_zooms_groups = [{} for _ in group_keys]
+        depth_values_groups = [{} for _ in group_keys]
         patch_index_zooms = {}
 
         loaded = False
@@ -901,7 +927,7 @@ class BaseDataset(Dataset):
                 ds_target_zoom = None
 
             for group_idx, group in enumerate(group_keys):
-                data_source, drop_mask_zoom_group = self.get_data(
+                data_source, drop_mask_zoom_group, depth_values = self.get_data(
                     ds_source_zoom,
                     patch_index,
                     selected_vars[group],
@@ -912,7 +938,7 @@ class BaseDataset(Dataset):
                 )
 
                 if ds_target is not None:
-                    data_target,  _ = self.get_data(
+                    data_target, _, _ = self.get_data(
                         ds_target_zoom,
                         patch_index,
                         selected_vars[group],
@@ -926,6 +952,8 @@ class BaseDataset(Dataset):
                 source_zooms_groups[group_idx][zoom] = data_source
                 target_zooms_groups[group_idx][zoom] = data_target
                 mask_mapping_zooms_groups[group_idx][zoom] = drop_mask_zoom_group
+                if depth_values is not None:
+                    depth_values_groups[group_idx][zoom] = depth_values
 
             patch_index_zooms[zoom] = torch.tensor(patch_index)
             
@@ -968,8 +996,14 @@ class BaseDataset(Dataset):
                 depth_ids = torch.arange(source_zooms[max_zoom].shape[-2], dtype=torch.long)
                 emb_group['variables_sampled'] = torch.tensor(list(var_indices[group])).view(1,-1).repeat_interleave(self.load_n_samples_time,dim=0)
                 emb_group['VariableEmbedder'] = torch.tensor(selected_var_ids[group]).view(1,-1).repeat_interleave(self.load_n_samples_time,dim=0)
+                emb_group['variable_names_sampled'] = [str(var_name) for var_name in selected_vars[group]]
                 emb_group['GroupDepthEmbedder'] = (group_id, depth_ids)
                 emb_group['MGEmbedder'] = emb_group['VariableEmbedder']
+                if depth_values_groups[group_idx]:
+                    emb_group['depth_values'] = depth_values_groups[group_idx].get(
+                        max_zoom,
+                        next(iter(depth_values_groups[group_idx].values())),
+                    )
 
                 if StaticVariableEmbedder is not None:
                     emb_group['StaticVariableEmbedder'] = StaticVariableEmbedder

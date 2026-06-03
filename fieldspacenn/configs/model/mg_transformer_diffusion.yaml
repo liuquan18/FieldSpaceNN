@@ -1,5 +1,11 @@
 _target_: fieldspacenn.src.models.mg_transformer.pl_mg_diffusion_model.Lightning_MG_diffusion_transformer
+coarse_to_fine_interp: nearest
+data_variables: ${data_variables}
 lambda_loss_dict:
+  aggregation: mean
+  depth_loss_scaler:
+    minimum: 0.2
+    slope: 0.001
   zooms:
     3:
       MSE_loss: 1
@@ -22,8 +28,7 @@ model:
   n_head_channels: 16
   use_mask: false
   n_groups_variables: [2]
-  layer_confs_emb:
-    aggregation: 'shift_scale'
+  emb_aggregation: shift_scale
   block_configs:
     "0":
       _target_: fieldspacenn.src.modules.field_space.field_space_attention.FieldSpaceAttentionConfig

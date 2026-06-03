@@ -9,6 +9,12 @@ from ...modules.field_space.field_space_attention import FieldSpaceAttentionModu
 from ...modules.field_space.healpix_convolution import MultiZoomHealpixConvBase, MultiZoomHealpixConvConfig
 from ...modules.grids.grid_layer import GridLayer
 from ...utils.helpers import check_get
+from .residual_blocks import (
+    ResidualApplyBlock,
+    ResidualApplyConfig,
+    ResidualSaveBlock,
+    ResidualSaveConfig,
+)
 
 defaults = {
     "predict_var":False,
@@ -18,9 +24,7 @@ defaults = {
     "emb_aggregation": "shift_scale",
     'embed_confs': {},
     'dropout': 0,
-    'learn_residual': False,
     'with_residual': False,
-    'masked_residual': False,
     'use_mask': False
 }
 
@@ -64,6 +68,9 @@ def create_missing_zooms(
         missing_zooms: Sequence[int],
         existing_zooms: Sequence[int],
     ) -> Dict[str, Any]:
+        if emb_group is None:
+            return {}
+
         emb_group_out = dict(emb_group)
         existing_zooms_set = {int(zoom) for zoom in existing_zooms}
 
@@ -95,7 +102,9 @@ def create_missing_zooms(
 
         return emb_group_out
 
-    output_groups, output_mask_groups, output_embedding_groups = [], [], []
+    output_groups = []
+    output_mask_groups = [] if mask_zooms_groups is not None else None
+    output_embedding_groups = [] if embedding_groups is not None else None
     output_sample_configs = {}
     for key, value in sample_configs.items():
         output_sample_configs[key] = copy.deepcopy(value)
@@ -122,22 +131,28 @@ def create_missing_zooms(
 
         if output_mask_groups is not None:
             mask_group_in = mask_zooms_groups[group_idx] if group_idx < len(mask_zooms_groups) else None
-            mask_zooms = _normalize_zoom_tensor_dict(mask_group_in)
-            ref_zoom_mask = max(mask_zooms.keys())
-            ref_mask = mask_zooms[ref_zoom_mask]
-            for zoom in missing_zooms:
-                if zoom in mask_zooms:
-                    continue
-                target_mask_shape = list(x_zooms[zoom].shape)
-                fill_value: Union[bool, float] = True if ref_mask.dtype == torch.bool else 1.0
-                mask_zooms[zoom] = ref_mask.new_full(tuple(target_mask_shape), fill_value)
+            if mask_group_in is None:
+                output_mask_groups.append(None)
+            else:
+                mask_zooms = _normalize_zoom_tensor_dict(mask_group_in)
+                ref_zoom_mask = max(mask_zooms.keys())
+                ref_mask = mask_zooms[ref_zoom_mask]
+                for zoom in missing_zooms:
+                    if zoom in mask_zooms:
+                        continue
+                    target_mask_shape = list(x_zooms[zoom].shape)
+                    fill_value: Union[bool, float] = True if ref_mask.dtype == torch.bool else 1.0
+                    mask_zooms[zoom] = ref_mask.new_full(tuple(target_mask_shape), fill_value)
 
-            output_mask_groups.append({zoom: mask_zooms[zoom] for zoom in sorted(mask_zooms.keys())})
+                output_mask_groups.append({zoom: mask_zooms[zoom] for zoom in sorted(mask_zooms.keys())})
 
-        emb_group_in = embedding_groups[group_idx] if group_idx < len(embedding_groups) else None
-        output_embedding_groups.append(
-            _copy_embedding_zoom_entries(emb_group_in, missing_zooms, existing_zooms=x_zooms.keys())
-        )
+        if output_embedding_groups is not None:
+            emb_group_in = embedding_groups[group_idx] if group_idx < len(embedding_groups) else None
+            output_embedding_groups.append(
+                _copy_embedding_zoom_entries(emb_group_in, missing_zooms, existing_zooms=x_zooms.keys())
+                if emb_group_in is not None
+                else None
+            )
 
     sample_zoom_keys = [key for key in output_sample_configs.keys() if isinstance(key, int)]
     ref_zoom_cfg = max(sample_zoom_keys)
@@ -179,6 +194,17 @@ def create_encoder_decoder_block(
     if isinstance(block_conf, ConservativeLayerConfig):
         block = ConservativeLayer(in_zooms)
         block.out_features = in_features
+
+    elif isinstance(block_conf, ResidualSaveConfig):
+        block = ResidualSaveBlock(out_zooms=in_zooms, out_features=in_features)
+
+    elif isinstance(block_conf, ResidualApplyConfig):
+        block = ResidualApplyBlock(
+            out_zooms=in_zooms,
+            out_features=in_features,
+            mode=block_conf.mode,
+            clear_after_apply=block_conf.clear_after_apply,
+        )
     
     elif isinstance(block_conf, FieldSpaceAttentionConfig):
         block = FieldSpaceAttentionModule(
@@ -221,6 +247,7 @@ def create_encoder_decoder_block(
                 n_head_channels = n_head_channels,
                 embed_confs = embed_confs,
                 separate_mlp_norm = block_conf.separate_mlp_norm,
+                mlp_residual_from_attention = block_conf.mlp_residual_from_attention,
                 use_variable_emb_layer = block_conf.use_variable_emb_layer,
                 use_variable_layer_norm = block_conf.use_variable_layer_norm,
                 use_variable_qkv = block_conf.use_variable_qkv,

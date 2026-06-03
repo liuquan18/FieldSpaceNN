@@ -1,5 +1,10 @@
 _target_: fieldspacenn.src.models.mg_transformer.pl_mg_model.LightningMGModel
+data_variables: ${data_variables}
 lambda_loss_dict:
+  aggregation: mean
+  depth_loss_scaler:
+    minimum: 0.2
+    slope: 0.001
   zooms:
     3:
       MSE_loss: 1

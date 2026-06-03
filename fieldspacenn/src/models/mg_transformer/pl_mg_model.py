@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from pytorch_lightning.utilities import rank_zero_only
 from ...modules.grids.grid_utils import decode_zooms
-from ...utils.losses import MGMultiLoss
+from ...utils.losses import MGMultiLoss, ReluPressureLevelScaler
 from ...utils.schedulers import CosineWarmupScheduler
 from ...utils.helpers import merge_sampling_dicts
 
@@ -17,8 +17,9 @@ class LightningMGModel(pl.LightningModule):
         model: Any,
         lr_groups: Mapping[str, Mapping[str, Any]],
         lambda_loss_dict: Mapping[str, Any],
+        data_variables: Optional[Mapping[str, Any]] = None,
         weight_decay: float = 0.0,
-        lambda_loss_groups: List = []
+        lambda_loss_groups: List = [],
     ) -> None:
         """
         Initialize the Lightning wrapper for multi-grid transformer models.
@@ -35,6 +36,12 @@ class LightningMGModel(pl.LightningModule):
         self.model: Any = model
         self.lr_groups: Mapping[str, Mapping[str, Any]] = lr_groups  
         self.weight_decay: float = weight_decay
+        self.loss_aggregation: str = str(lambda_loss_dict.get("aggregation", "mean")).lower()
+        if self.loss_aggregation not in {"mean", "sum"}:
+            raise ValueError(f"Unsupported loss aggregation '{self.loss_aggregation}'. Use 'mean' or 'sum'.")
+        depth_loss_scaler_cfg = self._extract_depth_loss_scaler_config(lambda_loss_dict)
+        self.depth_loss_scaler = ReluPressureLevelScaler(**depth_loss_scaler_cfg)
+        self.loss_group_names, self.variable_loss_metadata = self._normalize_variable_loss_config(data_variables)
         
         self.save_hyperparameters(ignore=['model'])
 
@@ -48,6 +55,154 @@ class LightningMGModel(pl.LightningModule):
             comp_loss_dict, grid_layers=model.grid_layers
         )
         self.lambda_loss_groups = lambda_loss_groups
+
+    @staticmethod
+    def _extract_depth_loss_scaler_config(
+        lambda_loss_dict: Mapping[str, Any],
+    ) -> Dict[str, float]:
+        depth_loss_scaler = lambda_loss_dict.get("depth_loss_scaler", {})
+        if not depth_loss_scaler:
+            return {"minimum": 0.2, "slope": 0.001}
+
+        if not isinstance(depth_loss_scaler, Mapping):
+            raise ValueError(
+                "`lambda_loss_dict.depth_loss_scaler` must be a mapping when provided."
+            )
+
+        minimum = float(depth_loss_scaler.get("minimum", 0.2))
+        slope = float(depth_loss_scaler.get("slope", 0.001))
+        return {"minimum": minimum, "slope": slope}
+
+    @staticmethod
+    def _normalize_variable_loss_config(
+        data_variables: Optional[Mapping[str, Any]],
+    ) -> tuple[List[str], Dict[str, Dict[str, Dict[str, Any]]]]:
+        if not data_variables:
+            return [], {}
+
+        group_names: List[str] = []
+        group_metadata: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for group_name, group_cfg in data_variables.items():
+            if group_name == "embedding":
+                continue
+
+            group_names.append(str(group_name))
+            group_metadata[str(group_name)] = {}
+
+            if isinstance(group_cfg, Mapping):
+                for var_name, var_cfg in group_cfg.items():
+                    metadata: Dict[str, Any] = {"loss_lambda": 1.0}
+                    if isinstance(var_cfg, Mapping):
+                        metadata["variable_id"] = (
+                            int(var_cfg["variable_id"]) if var_cfg.get("variable_id") is not None else None
+                        )
+                        if var_cfg.get("loss_lambda") is not None:
+                            metadata["loss_lambda"] = float(var_cfg["loss_lambda"])
+                    else:
+                        metadata["variable_id"] = int(var_cfg) if var_cfg is not None else None
+                    group_metadata[str(group_name)][str(var_name)] = metadata
+
+        return group_names, group_metadata
+
+    def _get_group_metadata(self, group_index: int) -> Dict[str, Dict[str, Any]]:
+        if group_index >= len(self.loss_group_names):
+            return {}
+        return self.variable_loss_metadata.get(self.loss_group_names[group_index], {})
+
+    def _find_variable_metadata(
+        self,
+        group_index: int,
+        variable_name: Optional[str],
+        variable_id: int,
+    ) -> Dict[str, Any]:
+        group_metadata = self._get_group_metadata(group_index)
+        if variable_name is not None and variable_name in group_metadata:
+            return group_metadata[variable_name]
+
+        for metadata in group_metadata.values():
+            if metadata.get("variable_id") == variable_id:
+                return metadata
+
+        return {"loss_lambda": 1.0, "variable_id": variable_id}
+
+    def _build_group_variable_weight_map(
+        self,
+        group_index: int,
+        group_output: Dict[int, torch.Tensor],
+        emb_group: Optional[Dict[str, Any]],
+    ) -> torch.Tensor:
+        reference = list(group_output.values())[0]
+        n_variables = reference.shape[1]
+        depth_size = reference.shape[-2]
+        if emb_group is None:
+            return torch.ones((n_variables, depth_size), device=reference.device, dtype=reference.dtype)
+
+        var_ids = emb_group.get("VariableEmbedder")
+        if isinstance(var_ids, torch.Tensor):
+            if var_ids.ndim > 1:
+                var_ids_tensor = var_ids[0]
+            else:
+                var_ids_tensor = var_ids
+        else:
+            var_ids_tensor = torch.arange(n_variables, device=reference.device)
+
+        var_ids_list = [int(var_id) for var_id in var_ids_tensor.tolist()]
+
+        var_names = emb_group.get("variable_names_sampled", [])
+        depth_values = emb_group.get("depth_values")
+        if isinstance(depth_values, torch.Tensor):
+            if depth_values.ndim > 1:
+                depth_values_tensor = depth_values[0]
+            else:
+                depth_values_tensor = depth_values
+            depth_values_tensor = depth_values_tensor.to(device=reference.device, dtype=reference.dtype)
+        else:
+            depth_values_tensor = None
+
+        if depth_values_tensor is not None:
+            if depth_values_tensor.numel() != depth_size:
+                raise ValueError(
+                    f"Depth values for group {group_index} have length {depth_values_tensor.numel()}, "
+                    f"but runtime depth size is {depth_size}."
+                )
+            depth_weights = self.depth_loss_scaler(depth_values_tensor).to(dtype=reference.dtype)
+        else:
+            depth_weights = torch.ones(depth_size, device=reference.device, dtype=reference.dtype)
+
+        base_weights = torch.tensor(
+            [
+                float(
+                    self._find_variable_metadata(
+                        group_index,
+                        str(var_names[var_pos]) if var_pos < len(var_names) else None,
+                        var_id,
+                    ).get("loss_lambda", 1.0)
+                )
+                for var_pos, var_id in enumerate(var_ids_list)
+            ],
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+        return base_weights.unsqueeze(1) * depth_weights.unsqueeze(0)
+
+    def _loss_normalizer(self, groups: Sequence[Dict[int, torch.Tensor]]) -> float:
+        if self.loss_aggregation == "sum":
+            return 1.0
+
+        total = 0
+        for group in groups:
+            if not group:
+                continue
+            tensor = list(group.values())[0]
+            total += int(tensor.shape[1] * tensor.shape[-2])
+        return float(total if total > 0 else 1)
+
+    @staticmethod
+    def _merge_loss_dict(dest: Dict[str, float], src: Dict[str, float]) -> Dict[str, float]:
+        for key, value in src.items():
+            dest[key] = dest.get(key, 0.0) + float(value)
+        return dest
 
 
     def forward(
@@ -160,17 +315,17 @@ class LightningMGModel(pl.LightningModule):
         emb_groups: Sequence[Dict[str, Any]],
         prefix: str,
     ):
-        loss_dict_total = {}
+        loss_dict_total: Dict[str, float] = {}
         total_loss = 0
         group_loss_inputs = []
 
-        lambda_groups = self.lambda_loss_groups if len(self.lambda_loss_groups)>0 else [1.0]*len(source_groups)
-        weight_groups = torch.tensor([list(t.values())[0].shape[1]*list(t.values())[0].shape[-2] for t in source_groups], device=emb_groups[0]['VariableEmbedder'].device)
-        weight_groups = weight_groups/weight_groups.sum()
+        lambda_groups = self.lambda_loss_groups if len(self.lambda_loss_groups) > 0 else [1.0] * len(source_groups)
+        normalizer = self._loss_normalizer(target_groups)
 
-        for source, output, target, mask, emb, lambda_group, weight_group in zip(
-            source_groups, output_groups, target_groups, mask_groups, emb_groups, lambda_groups, weight_groups
+        for group_index, (source, output, target, mask, emb, lambda_group) in enumerate(
+            zip(source_groups, output_groups, target_groups, mask_groups, emb_groups, lambda_groups)
         ):
+            variable_weight_map = self._build_group_variable_weight_map(group_index, target, emb)
             group_loss_inputs.append(
                 {
                     "source": source,
@@ -178,16 +333,26 @@ class LightningMGModel(pl.LightningModule):
                     "output": output,
                     "mask": mask,
                     "emb": emb,
+                    "group_index": group_index,
                     "lambda_group": float(lambda_group),
-                    "weight_group": weight_group,
+                    "variable_weight_map": variable_weight_map,
                 }
             )
         
             loss, loss_dict = self.loss_zooms(
-                output, target, mask=mask, sample_configs=sample_configs_target, prefix=f'{prefix}/', emb=emb
+                output,
+                target,
+                mask=mask,
+                sample_configs=sample_configs_target,
+                prefix=f"{prefix}/",
+                emb=emb,
+                variable_weight_map=variable_weight_map,
+                group_index=group_index,
+                group_lambda=float(lambda_group),
+                normalizer=normalizer,
             )
-            total_loss += loss * (float(lambda_group) * weight_group)
-            loss_dict_total.update(loss_dict)
+            total_loss += loss
+            self._merge_loss_dict(loss_dict_total, loss_dict)
 
         if not self.loss_composed.has_elements:
             return total_loss, loss_dict_total, output_groups
@@ -198,6 +363,7 @@ class LightningMGModel(pl.LightningModule):
             prefix=prefix,
             total_loss=total_loss,
             loss_dict_total=loss_dict_total,
+            normalizer=normalizer,
         )
         return total_loss, loss_dict_total, output_groups
 
@@ -208,6 +374,7 @@ class LightningMGModel(pl.LightningModule):
         prefix: str,
         total_loss: torch.Tensor | float,
         loss_dict_total: Dict[str, float],
+        normalizer: float,
     ) -> tuple[torch.Tensor | float, Dict[str, float]]:
         max_zoom = max((max(group["target"].keys()) for group in group_loss_inputs if group["target"]), default=None)
         if max_zoom is None:
@@ -244,9 +411,13 @@ class LightningMGModel(pl.LightningModule):
                 sample_configs=sample_configs_target,
                 prefix=f'{prefix}/composed_',
                 emb=group_input["emb"],
+                variable_weight_map=group_input["variable_weight_map"],
+                group_index=group_input["group_index"],
+                group_lambda=group_input["lambda_group"],
+                normalizer=normalizer,
             )
-            total_loss += loss * (group_input["lambda_group"] * group_input["weight_group"])
-            loss_dict_total.update(loss_dict)
+            total_loss += loss
+            self._merge_loss_dict(loss_dict_total, loss_dict)
 
         return total_loss, loss_dict_total
 

@@ -825,9 +825,11 @@ class BaseDataset(Dataset):
         data_source = encode_zooms(data_source, sample_configs_source, patch_index_zooms)
         data_target = encode_zooms(data_target, sample_configs_target, patch_index_zooms)
 
+        available_zooms = sorted(data_source.keys())
+
         if not hr_dopout and self.p_dropout_all > 0:
             drop = False
-            for zoom in sorted(self.sampling_zooms.keys()):
+            for zoom in available_zooms:
 
                 if self.p_dropout_all_zooms[zoom] > 0 and not drop:
                     drop = torch.rand(1) < self.p_dropout_all_zooms[zoom]
@@ -872,8 +874,9 @@ class BaseDataset(Dataset):
         
         
         # Optionally mask the last timesteps and repeat or zero them out.
-        if any([z.get('mask_n_last_ts', 0) > 0 for z in self.sampling_zooms.values()]):
-            for zoom, sampling_zoom in self.sampling_zooms.items():
+        if any(self.sampling_zooms[zoom].get('mask_n_last_ts', 0) > 0 for zoom in available_zooms):
+            for zoom in available_zooms:
+                sampling_zoom = self.sampling_zooms[zoom]
                 mask_n_last_ts = sampling_zoom.get('mask_n_last_ts', 0)
                 if mask_n_last_ts > 0:
                     time_len = data_source[zoom].shape[2]

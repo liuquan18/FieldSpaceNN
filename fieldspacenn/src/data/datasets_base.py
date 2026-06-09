@@ -3,11 +3,13 @@ import json
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import torch
 import xarray as xr
-from omegaconf import ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from einops import rearrange
 from torch.utils.data import Dataset
+from xarray.coding.times import decode_cf_datetime
 import warnings
 warnings.filterwarnings("ignore", message=".*fails while guessing")
 warnings.filterwarnings("ignore", message="ZarrUserWarning.*")
@@ -126,6 +128,65 @@ def _resolve_global_variable_ids(
 
     return resolved_ids
 
+
+def _normalize_variable_group_zooms_config(
+    group_zooms_cfg: Optional[Mapping[str, Any]],
+    group_names: Sequence[str],
+    default_zooms: Sequence[int],
+) -> Dict[str, List[int]]:
+    """
+    Normalize optional per-group zoom filters.
+
+    When a group is omitted, it defaults to all configured sampling zooms.
+    """
+    if isinstance(group_zooms_cfg, (DictConfig, ListConfig)):
+        group_zooms_cfg = OmegaConf.to_container(group_zooms_cfg, resolve=True)
+
+    if group_zooms_cfg is None:
+        group_zooms_cfg = {}
+
+    if not isinstance(group_zooms_cfg, Mapping):
+        raise ValueError(
+            f"Unsupported `variable_group_zooms` config type: {type(group_zooms_cfg)}. "
+            "Use a mapping of group names to zoom lists."
+        )
+
+    default_zoom_list = [int(zoom) for zoom in default_zooms]
+    default_zoom_set = set(default_zoom_list)
+    group_names_set = {str(group_name) for group_name in group_names}
+    unknown_groups = sorted(set(group_zooms_cfg.keys()) - group_names_set)
+    if unknown_groups:
+        raise ValueError(
+            "`variable_group_zooms` contains unknown groups: "
+            f"{unknown_groups}. Expected one of {sorted(group_names_set)}."
+        )
+
+    normalized: Dict[str, List[int]] = {}
+    for group_name in group_names:
+        zooms_cfg = group_zooms_cfg.get(group_name, default_zoom_list)
+        if zooms_cfg is None:
+            zooms = list(default_zoom_list)
+        elif isinstance(zooms_cfg, (int, np.integer)):
+            zooms = [int(zooms_cfg)]
+        elif isinstance(zooms_cfg, (list, tuple, set, ListConfig)):
+            zooms = [int(zoom) for zoom in zooms_cfg]
+        else:
+            raise ValueError(
+                f"Unsupported zoom config for group `{group_name}`: {type(zooms_cfg)}. "
+                "Use an int, a list of ints, or null."
+            )
+
+        invalid_zooms = sorted(set(zooms) - default_zoom_set)
+        if invalid_zooms:
+            raise ValueError(
+                f"`variable_group_zooms[{group_name}]` contains zooms {invalid_zooms}, "
+                f"but only sampling zooms {sorted(default_zoom_set)} are available."
+            )
+
+        normalized[group_name] = sorted(dict.fromkeys(zooms))
+
+    return normalized
+
 #def create_mask(random_p, drop_mask, ):
 
 class BaseDataset(Dataset):
@@ -150,6 +211,7 @@ class BaseDataset(Dataset):
         normalize_data: bool = True,
         mask_ts_mode: str = 'repeat',
         variables_as_features: bool = False,
+        variable_group_zooms: Optional[Mapping[str, Any]] = None,
         load_n_samples_time: int = 1,
         target_time_shift: int = 0,
         overwrite_depths: Optional[Sequence[float]] = None,
@@ -176,6 +238,9 @@ class BaseDataset(Dataset):
         :param normalize_data: Whether to normalize variables with saved stats.
         :param mask_ts_mode: Strategy for masking the last timestep.
         :param variables_as_features: Whether to treat variables as features.
+        :param variable_group_zooms: Optional mapping from variable-group name to the
+            zoom levels where that group should be loaded. Omitted groups default to all
+            sampling zooms.
         :param load_n_samples_time: Number of time samples stacked as batch.
         :param target_time_shift: Shift applied to target sample centers relative to source centers.
         :param overwrite_depths: Optional replacement values for the vertical ``level``
@@ -330,6 +395,14 @@ class BaseDataset(Dataset):
         # Build variable group indices for embedding and masking.
         self.variables_by_group, explicit_variable_ids = _normalize_variables_config(self.data_dict['variables'])
         self.data_dict['variables'] = self.variables_by_group
+        self.variable_group_zooms = _normalize_variable_group_zooms_config(
+            variable_group_zooms,
+            list(self.variables_by_group.keys()),
+            self.zooms,
+        )
+        self.group_zooms = {
+            group_name: set(group_zooms) for group_name, group_zooms in self.variable_group_zooms.items()
+        }
         self.all_variable_ids = _resolve_global_variable_ids(self.variables_by_group, explicit_variable_ids)
         all_variables: List[str] = []
         self.group_ids: Dict[str, int] = {}
@@ -594,6 +667,56 @@ class BaseDataset(Dataset):
 
         return data_g, mask, depth_values
 
+    def _decode_time_values(self, ds: xr.Dataset) -> np.ndarray:
+        """
+        Decode a dataset time coordinate into absolute datetimes.
+
+        :param ds: Input dataset with a ``time`` coordinate.
+        :return: NumPy array of decoded datetime-like values.
+        """
+        time_values = np.asarray(ds["time"].values)
+        if np.issubdtype(time_values.dtype, np.datetime64):
+            return time_values
+
+        time_coord = ds["time"]
+        units = time_coord.attrs.get("units") or time_coord.encoding.get("units")
+        calendar = time_coord.attrs.get("calendar") or time_coord.encoding.get("calendar")
+        if units is not None:
+            return decode_cf_datetime(time_values, units=units, calendar=calendar)
+
+        if np.issubdtype(time_values.dtype, np.number):
+            return pd.to_datetime(time_values, unit="s", utc=True).tz_localize(None).to_numpy()
+
+        raise ValueError("Could not decode dataset time coordinate; missing CF units and non-datetime dtype.")
+
+    def _get_time_progress(self, ds: xr.Dataset) -> torch.Tensor:
+        """
+        Build raw cyclical time phases for a zoom sample.
+
+        The output stores only raw fractions, not precomputed sinusoidal features.
+
+        :param ds: Zoom-sliced dataset for the current sample.
+        :return: Tensor of shape ``(b, t, 2)`` containing
+            ``[day_fraction, year_fraction]``.
+        """
+        decoded_times = self._decode_time_values(ds)
+        timestamps = pd.DatetimeIndex(decoded_times.reshape(-1))
+        timestamps_date = pd.DatetimeIndex(timestamps.date)
+
+        utc_day_fraction = np.asarray(
+            (timestamps - timestamps_date) / pd.Timedelta(days=1),
+            dtype=np.float32,
+        )
+        year_length = (365 + np.asarray(timestamps.is_leap_year, dtype=np.int64)).astype(np.float32)
+        year_fraction = (
+            np.asarray(timestamps.dayofyear, dtype=np.int64).astype(np.float32) - 1.0 + utc_day_fraction
+        ) / year_length
+
+        day_fraction = torch.from_numpy(utc_day_fraction).view(self.load_n_samples_time, -1)
+        year_fraction = torch.from_numpy(year_fraction).view(self.load_n_samples_time, -1)
+
+        return torch.stack((day_fraction, year_fraction), dim=-1).to(torch.float32)
+
     def _resolve_depth_values(self, level_values: Any) -> torch.Tensor:
         depth_values = torch.as_tensor(level_values, dtype=torch.float32)
         if self.overwrite_depths is None:
@@ -791,7 +914,8 @@ class BaseDataset(Dataset):
             shape ``(b, v, t, n, d, f)`` (or ``(b, 1, t, n, 1, f)`` when variables are folded
             into features), ``masks`` follow the same shape, ``embeddings`` holds per-group
             tensors such as ``VariableEmbedder`` of shape ``(v,)``, ``GroupDepthEmbedder`` as
-            ``(group_id, depth_ids)``, and ``TimeEmbedder`` of shape ``(b, t)``, and
+            ``(group_id, depth_ids)``, ``TimeEmbedder`` of shape ``(b, t)``, and
+            ``TimeProgressEmbedder`` of shape ``(b, t, 2)``, and
             ``patch_index_zooms`` maps zoom to index tensors of shape ``(1,)``.
         """
         selected_vars = {}
@@ -841,6 +965,7 @@ class BaseDataset(Dataset):
         source_zooms_groups = [{} for _ in group_keys]
         target_zooms_groups = [{} for _ in group_keys]
         data_time_zooms = {}
+        time_progress_zooms = {}
         mask_mapping_zooms_groups = [{} for _ in group_keys]
         depth_values_groups = [{} for _ in group_keys]
         patch_index_zooms = {}
@@ -898,7 +1023,11 @@ class BaseDataset(Dataset):
                     mapping_zoom,
                     zoom)
             
-            data_time_zooms[zoom] = torch.from_numpy(ds_source_zoom.time.values).view(self.load_n_samples_time,-1).to(torch.float32)
+            data_time_zooms[zoom] = torch.as_tensor(
+                np.array(ds_source_zoom.time.values, copy=True),
+                dtype=torch.float32,
+            ).view(self.load_n_samples_time, -1)
+            time_progress_zooms[zoom] = self._get_time_progress(ds_source_zoom)
             
             target_window_differs = (
                 self.target_time_shift != 0
@@ -927,6 +1056,9 @@ class BaseDataset(Dataset):
                 ds_target_zoom = None
 
             for group_idx, group in enumerate(group_keys):
+                if zoom not in self.group_zooms[group]:
+                    continue
+
                 data_source, drop_mask_zoom_group, depth_values = self.get_data(
                     ds_source_zoom,
                     patch_index,
@@ -990,6 +1122,10 @@ class BaseDataset(Dataset):
                 target_zooms_groups_out.append(target_zooms)
                 mask_zooms_groups.append(mask_group)
 
+                if not source_zooms:
+                    emb_groups.append({})
+                    continue
+
                 emb_group = emb.copy()
                 group_id = torch.tensor(self.embed_group_ids[group], dtype=torch.long)
                 max_zoom = max(source_zooms.keys())
@@ -1009,21 +1145,36 @@ class BaseDataset(Dataset):
                     emb_group['StaticVariableEmbedder'] = StaticVariableEmbedder
 
                     
-                emb_group['TimeEmbedder'] = data_time_zooms
+                emb_group['TimeEmbedder'] = {
+                    zoom: data_time_zooms[zoom] for zoom in source_zooms.keys()
+                }
+                emb_group['TimeProgressEmbedder'] = {
+                    zoom: time_progress_zooms[zoom] for zoom in source_zooms.keys()
+                }
+                emb_group['TimeIndexEmbedder'] = emb_group['TimeProgressEmbedder']
                 emb_groups.append(emb_group)
         
             source_zooms_groups_out_ = {}
             target_zooms_groups_out_ = {}
             mask_zooms_groups_ = {}
 
-        if self.variables_as_features:
-            for zoom in source_zooms_groups_out[0].keys():
-                source_zooms_groups_out_[zoom] = torch.concat([group[zoom] for group in source_zooms_groups_out],dim=-1)
-                target_zooms_groups_out_[zoom] =  torch.concat([group[zoom] for group in target_zooms_groups_out],dim=-1)
-                mask_zooms_groups_[zoom] = torch.concat([group[zoom] for group in mask_zooms_groups], dim=-1)
+        if self.variables_as_features and source_zooms_groups_out:
+            combined_zooms = sorted(
+                set().union(*(group.keys() for group in source_zooms_groups_out if group))
+            )
+            for zoom in combined_zooms:
+                source_groups_zoom = [group[zoom] for group in source_zooms_groups_out if zoom in group]
+                target_groups_zoom = [group[zoom] for group in target_zooms_groups_out if zoom in group]
+                mask_groups_zoom = [group[zoom] for group in mask_zooms_groups if zoom in group]
+
+                source_zooms_groups_out_[zoom] = torch.concat(source_groups_zoom, dim=-1)
+                target_zooms_groups_out_[zoom] = torch.concat(target_groups_zoom, dim=-1)
+                mask_zooms_groups_[zoom] = torch.concat(mask_groups_zoom, dim=-1)
 
             emb = {'StaticVariableEmbedder': emb_groups[0]['StaticVariableEmbedder'],
                     'TimeEmbedder': emb_groups[0]['TimeEmbedder'],
+                    'TimeProgressEmbedder': emb_groups[0]['TimeProgressEmbedder'],
+                    'TimeIndexEmbedder': emb_groups[0]['TimeIndexEmbedder'],
                     'VarialeEmbedder': torch.zeros(source_zooms_groups_out_[zoom].shape[-1], dtype=torch.long)}
 
             emb_groups = [emb]

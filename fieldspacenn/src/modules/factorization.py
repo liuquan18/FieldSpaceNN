@@ -278,6 +278,7 @@ class TuckerFacLayer(nn.Module):
         x_shape = list(x.shape[:5])
         x_dims_in = x_shape + self.in_features 
         x_dims_out = x_shape + self.out_features 
+        x_dims_out[1] = self.n_variables if self.n_variables > 1 else x_dims_out[1]
 
         x = x.reshape(x_dims_in)
         

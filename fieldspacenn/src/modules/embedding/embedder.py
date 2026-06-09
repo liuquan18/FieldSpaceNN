@@ -158,6 +158,180 @@ class TimeEmbedder(ZoomBaseEmbedder):
         )
 
 
+class TimeIndexEmbedder(ZoomBaseEmbedder):
+    def __init__(
+        self,
+        name: str,
+        in_channels: int,
+        embed_dim: int,
+        zoom: int,
+        init_value: Optional[float] = None,
+        **kwargs: Any
+    ) -> None:
+        """
+        Learn a time-position embedding indexed by the time axis length.
+
+        :param name: Embedder name.
+        :param in_channels: Maximum supported number of time indices.
+        :param embed_dim: Dimensionality of the embedding output.
+        :param zoom: Zoom level this embedder operates on.
+        :param init_value: Optional constant initialization value.
+        :return: None.
+        """
+        super().__init__(name, in_channels, embed_dim, zoom)
+
+        self.keep_dims: List[str] = ["b", "t", "c"]
+        self.zoom: int = zoom
+        self.embedding_fn: nn.Module = nn.Embedding(self.in_channels, self.embed_dim)
+
+        if init_value is not None:
+            self.embedding_fn.weight.data.fill_(init_value)
+
+    def forward(
+        self,
+        emb: Dict[int, torch.Tensor],
+        output_zoom: Optional[int] = None,
+        sample_configs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        emb_zoom = emb[self.zoom]
+
+        if output_zoom is not None and output_zoom != self.zoom and "t" in self.keep_dims:
+            ts_start = sample_configs[self.zoom]["n_past_ts"] - sample_configs[output_zoom]["n_past_ts"]
+            ts_end = sample_configs[self.zoom]["n_future_ts"] - sample_configs[output_zoom]["n_future_ts"]
+            nt = emb_zoom.shape[1]
+            emb_zoom = torch.index_select(
+                emb_zoom,
+                dim=1,
+                index=torch.arange(ts_start, nt - ts_end, device=emb_zoom.device),
+            )
+
+        batch_size = emb_zoom.shape[0]
+        n_time = emb_zoom.shape[1]
+        if n_time > self.in_channels:
+            raise ValueError(
+                f"`TimeIndexEmbedder` supports at most {self.in_channels} time indices, but received {n_time}."
+            )
+
+        time_indices = torch.arange(n_time, device=emb_zoom.device, dtype=torch.long).view(1, -1).expand(batch_size, -1)
+        return self.embedding_fn(time_indices)
+
+
+class TimeProgressEmbedder(ZoomBaseEmbedder):
+    def __init__(
+        self,
+        name: str,
+        in_channels: int,
+        embed_dim: int,
+        zoom: int,
+        grid_layers: Optional[Dict[str, GridLayer]] = None,
+        wave_length: float = 1.0,
+        wave_length_2: Optional[float] = None,
+        **kwargs: Any
+    ) -> None:
+        """
+        Embed raw day/year phase fractions, optionally varying per spatial token.
+
+        :param name: Embedder name.
+        :param in_channels: Number of phase channels (expected: 2).
+        :param embed_dim: Dimensionality of the embedding output.
+        :param zoom: Zoom level this embedder operates on.
+        :param wave_length: Primary wavelength for random Fourier features.
+        :param wave_length_2: Optional secondary wavelength.
+        :return: None.
+        """
+        super().__init__(name, in_channels, embed_dim, zoom)
+
+        self.keep_dims: List[str] = ["b", "t", "s", "c"]
+        self.zoom: int = zoom
+        self.grid_layer: Optional[GridLayer] = None if grid_layers is None else grid_layers[str(zoom)]
+
+        longitude_fraction = torch.empty(0, dtype=torch.float32)
+        if self.grid_layer is not None:
+            lon_rad = self.grid_layer.coordinates[..., 0].reshape(-1).to(torch.float32)
+            longitude_fraction = lon_rad / (2 * torch.pi)
+        self.register_buffer("longitude_fraction", longitude_fraction, persistent=False)
+        self.longitude_fraction: torch.Tensor
+
+        self.embedding_fn: nn.Module = nn.Sequential(
+            RandomFourierLayer(
+                in_features=self.in_channels,
+                n_neurons=self.embed_dim,
+                wave_length=wave_length,
+                wave_length_2=wave_length_2,
+            ),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+
+    def _get_patch_longitude_fraction(
+        self,
+        sample_configs: Optional[Dict[str, Any]],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.longitude_fraction.numel() == 0:
+            return None
+
+        lon_fraction = self.longitude_fraction.to(device=device, dtype=dtype)
+        if self.grid_layer is not None and sample_configs is not None and self.zoom in sample_configs:
+            idx = self.grid_layer.get_idx_of_patch(
+                **sample_configs[self.zoom],
+                return_local=False,
+            )
+            lon_fraction = lon_fraction[idx]
+            if lon_fraction.ndim == 1:
+                lon_fraction = lon_fraction.view(1, 1, -1, 1)
+            else:
+                lon_fraction = lon_fraction.view(lon_fraction.shape[0], 1, lon_fraction.shape[1], 1)
+        else:
+            lon_fraction = lon_fraction.view(1, 1, -1, 1)
+
+        return lon_fraction
+
+    def forward(
+        self,
+        emb: Dict[int, torch.Tensor],
+        output_zoom: Optional[int] = None,
+        sample_configs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        emb_zoom = emb[self.zoom]
+
+        if output_zoom is not None and output_zoom != self.zoom and "t" in self.keep_dims:
+            ts_start = sample_configs[self.zoom]["n_past_ts"] - sample_configs[output_zoom]["n_past_ts"]
+            ts_end = sample_configs[self.zoom]["n_future_ts"] - sample_configs[output_zoom]["n_future_ts"]
+            nt = emb_zoom.shape[1]
+            emb_zoom = torch.index_select(
+                emb_zoom,
+                dim=1,
+                index=torch.arange(ts_start, nt - ts_end, device=emb_zoom.device),
+            )
+
+        if emb_zoom.ndim == 3:
+            emb_zoom = emb_zoom.unsqueeze(2)
+
+        lon_fraction = self._get_patch_longitude_fraction(
+            sample_configs=sample_configs,
+            device=emb_zoom.device,
+            dtype=emb_zoom.dtype,
+        )
+        if lon_fraction is not None:
+            if emb_zoom.shape[2] == 1 and lon_fraction.shape[2] != 1:
+                emb_zoom = emb_zoom.expand(-1, -1, lon_fraction.shape[2], -1)
+            elif emb_zoom.shape[2] != lon_fraction.shape[2]:
+                raise ValueError(
+                    f"`TimeProgressEmbedder` expected {lon_fraction.shape[2]} spatial positions at zoom {self.zoom}, "
+                    f"but received {emb_zoom.shape[2]}."
+                )
+
+            emb_zoom = emb_zoom.clone()
+            emb_zoom[..., 0:1] = torch.remainder(emb_zoom[..., 0:1] + lon_fraction, 1.0)
+
+        return self.embedding_fn(emb_zoom)
+
+
 class CoordinateEmbedder(ZoomBaseEmbedder):
     """
     A neural network module to embed longitude and latitude coordinates.

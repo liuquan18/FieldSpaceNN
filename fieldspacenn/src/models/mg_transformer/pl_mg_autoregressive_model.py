@@ -210,6 +210,8 @@ class LightningMGAutoregressiveModel(LightningMGModel):
                     emb_group = dict(group)
                     if 'TimeEmbedder' in group and isinstance(group['TimeEmbedder'], dict):
                         emb_group['TimeEmbedder'] = shift_timeembedding(group['TimeEmbedder'])
+                    if 'TimeProgressEmbedder' in group and isinstance(group['TimeProgressEmbedder'], dict):
+                        emb_group['TimeProgressEmbedder'] = shift_time_progress_embedding(group['TimeProgressEmbedder'])
                     shifted_emb_groups.append(emb_group)
                 current_emb_groups = shifted_emb_groups
         if output_steps is not None:
@@ -415,6 +417,19 @@ class LightningMGAutoregressiveModel(LightningMGModel):
 def shift_timeembedding(emb_time: Dict[int, torch.Tensor]):
     emb_time = emb_time.copy()
     for zoom, time_zoom in emb_time.items():
-        emb_time[zoom] = time_zoom + time_zoom.diff().mean()
+        if time_zoom.shape[1] < 2:
+            continue
+        emb_time[zoom] = time_zoom + time_zoom.diff(dim=1).mean(dim=1, keepdim=True)
+
+    return emb_time
+
+
+def shift_time_progress_embedding(emb_time: Dict[int, torch.Tensor]):
+    emb_time = emb_time.copy()
+    for zoom, time_zoom in emb_time.items():
+        if time_zoom.shape[1] < 2:
+            continue
+        delta = torch.remainder(time_zoom.diff(dim=1), 1.0).mean(dim=1, keepdim=True)
+        emb_time[zoom] = torch.remainder(time_zoom + delta, 1.0)
 
     return emb_time

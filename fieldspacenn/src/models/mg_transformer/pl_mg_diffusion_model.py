@@ -240,6 +240,11 @@ class Lightning_MG_diffusion_transformer(LightningMGModel, LightningProbabilisti
                     'VariableEmbedder': emb_p_group['VariableEmbedder'][0:1],
                     'TimeEmbedder': {int(zoom): emb_p_group['TimeEmbedder'][zoom][0:1] for zoom in emb_p_group['TimeEmbedder'].keys()},
                 }
+                if 'TimeProgressEmbedder' in emb_p_group:
+                    emb_p['TimeProgressEmbedder'] = {
+                        int(zoom): emb_p_group['TimeProgressEmbedder'][zoom][0:1]
+                        for zoom in emb_p_group['TimeProgressEmbedder'].keys()
+                    }
                 if 'variables_sampled' in emb_p_group:
                     emb_p['variables_sampled'] = emb_p_group['variables_sampled'][0:1]
                 if 'variable_names_sampled' in emb_p_group:

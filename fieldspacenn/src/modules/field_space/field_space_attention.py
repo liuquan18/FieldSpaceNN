@@ -875,8 +875,8 @@ class FieldSpaceAttentionBlock(nn.Module):
         self.use_variable_mlp_gammas: bool = use_variable_mlp_gammas
 
         gamma_shape_att = [n_variables, *self.token_size_space] if use_variable_att_gammas else self.token_size_space
-        self.gamma_res = nn.Parameter(torch.ones(gamma_shape_att) * 1e-7, requires_grad=True)
-        self.gamma = nn.Parameter(torch.ones(gamma_shape_att) * 1e-7, requires_grad=True)
+        self.gamma_res = nn.Parameter(torch.ones(gamma_shape_att) * 1e-12, requires_grad=True)
+        self.gamma = nn.Parameter(torch.ones(gamma_shape_att) * 1e-12, requires_grad=True)
 
         self.mlp = MLP_fac(
             token_size_in_mlp_overlap,
@@ -889,8 +889,8 @@ class FieldSpaceAttentionBlock(nn.Module):
             gamma=False,
         )
         gamma_shape_mlp = [len(target_zooms), n_variables] if use_variable_mlp_gammas else [len(target_zooms)]
-        self.gamma_res_mlp = nn.Parameter(torch.ones(gamma_shape_mlp) * 1e-7, requires_grad=True)
-        self.gamma_mlp = nn.Parameter(torch.ones(gamma_shape_mlp) * 1e-7, requires_grad=True)
+        self.gamma_res_mlp = nn.Parameter(torch.ones(gamma_shape_mlp) * 1e-12, requires_grad=True)
+        self.gamma_mlp = nn.Parameter(torch.ones(gamma_shape_mlp) * 1e-12, requires_grad=True)
 
         self.pattern_tokens: str = 'b v (T t) N n (D d) f ->  b v T N D t n d f'
         self.pattern_tokens_reverse: str = 'b v T N D t n d f ->  b v (T t) (N n) (D d) f'
@@ -997,7 +997,10 @@ class FieldSpaceAttentionBlock(nn.Module):
 
         # Shallow copy to avoid mutating the caller's embeddings.
         emb_cpy = dict(emb)
-        emb_cpy['TimeEmbedder'] = {max(self.q_zooms): emb_cpy['TimeEmbedder'][max(self.q_zooms)]}
+        for emb_key in ("TimeEmbedder", "TimeProgressEmbedder"):
+            if emb_key not in emb_cpy or not isinstance(emb_cpy[emb_key], dict):
+                continue
+            emb_cpy[emb_key] = {max(self.q_zooms): emb_cpy[emb_key][max(self.q_zooms)]}
 
         return emb_cpy
 

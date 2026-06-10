@@ -168,6 +168,7 @@ def create_encoder_decoder_block(
     in_features: Sequence[int],
     n_groups_variables: Sequence[int],
     grid_layers: nn.ModuleDict,
+    n_groups_depths: Optional[Sequence[int]] = None,
     **kwargs: Any,
 ) -> nn.Module:
     """
@@ -189,6 +190,8 @@ def create_encoder_decoder_block(
     use_mask = check_get([block_conf, kwargs, defaults], "use_mask")
     n_head_channels = check_get([block_conf,kwargs,defaults], "n_head_channels")
     att_dim = check_get([block_conf,kwargs,defaults], "att_dim")
+    if n_groups_depths is None:
+        n_groups_depths = [1] * len(n_groups_variables)
 
     # Select the correct block implementation based on the config type.
     if isinstance(block_conf, ConservativeLayerConfig):
@@ -223,6 +226,7 @@ def create_encoder_decoder_block(
                 multi_shift= block_conf.multi_shift,
                 att_dim = att_dim,
                 n_groups_variables = n_groups_variables,
+                n_groups_depths = list(n_groups_depths),
                 token_len_time = block_conf.token_len_time,
                 token_len_depth = block_conf.token_len_depth,
                 token_overlap_space = block_conf.token_overlap_space,
@@ -232,9 +236,12 @@ def create_encoder_decoder_block(
                 token_overlap_mlp_depth = block_conf.token_overlap_mlp_depth,
                 rank_variables = block_conf.rank_variables,
                 rank_space = block_conf.rank_space,
+                n_rank_space = block_conf.n_rank_space,
                 rank_time = block_conf.rank_time,
                 rank_depth = block_conf.rank_depth,
                 rank_features = block_conf.rank_features,
+                n_times = block_conf.n_times,
+                n_depths = list(n_groups_depths) if getattr(block_conf, "n_depths_is_default", False) else block_conf.n_depths,
                 seq_len_zoom = block_conf.seq_len_zoom,
                 seq_len_time =  block_conf.seq_len_time,
                 seq_len_depth = block_conf.seq_len_depth,
@@ -252,11 +259,17 @@ def create_encoder_decoder_block(
                 use_variable_layer_norm = block_conf.use_variable_layer_norm,
                 use_variable_qkv = block_conf.use_variable_qkv,
                 use_variable_mlp = block_conf.use_variable_mlp,
+                use_indexed_emb_layer = block_conf.use_indexed_emb_layer,
+                use_indexed_layer_norm = block_conf.use_indexed_layer_norm,
+                use_indexed_qkv = block_conf.use_indexed_qkv,
+                use_indexed_mlp = block_conf.use_indexed_mlp,
                 use_ranks_emb_layer = block_conf.use_ranks_emb_layer,
                 use_ranks_qkv = block_conf.use_ranks_qkv,
                 use_ranks_mlp = block_conf.use_ranks_mlp,
                 use_variable_att_gammas = block_conf.use_variable_att_gammas,
                 use_variable_mlp_gammas = block_conf.use_variable_mlp_gammas,
+                use_indexed_att_gammas = block_conf.use_indexed_att_gammas,
+                use_indexed_mlp_gammas = block_conf.use_indexed_mlp_gammas,
                 fac_mode=fac_mode,
                 emb_aggregation=emb_aggregation)
         block.out_features = in_features

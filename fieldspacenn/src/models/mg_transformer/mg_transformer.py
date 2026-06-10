@@ -19,6 +19,7 @@ class MG_Transformer(MG_base_model):
         in_zooms: Sequence[int],
         in_features: int = 1,
         n_groups_variables: Sequence[int] = [1],
+        n_groups_depths: Optional[Sequence[int]] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -36,6 +37,9 @@ class MG_Transformer(MG_base_model):
 
         self.in_zooms: Sequence[int] = in_zooms
         self.in_features: int = in_features
+        self.n_groups_depths: Sequence[int] = (
+            list(n_groups_depths) if n_groups_depths is not None else [1] * len(n_groups_variables)
+        )
 
         self.Blocks: nn.ModuleDict = nn.ModuleDict()
 
@@ -43,7 +47,14 @@ class MG_Transformer(MG_base_model):
 
         for block_key, block_conf in block_configs.items():
             assert isinstance(block_key, str), "block keys should be strings"
-            block = create_encoder_decoder_block(block_conf, in_zooms, in_features, n_groups_variables, self.grid_layers)
+            block = create_encoder_decoder_block(
+                block_conf,
+                in_zooms,
+                in_features,
+                n_groups_variables,
+                self.grid_layers,
+                self.n_groups_depths,
+            )
 
             self.Blocks[block_key] = block
 

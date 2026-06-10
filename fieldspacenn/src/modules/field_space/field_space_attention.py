@@ -6,7 +6,8 @@ from omegaconf import ListConfig
 import torch
 import torch.nn as nn
 
-from ..base import get_layer, MLP_fac, _get_layer_variable_indices
+from ..base import get_layer, MLP_fac
+from ..factorization import broadcast_indexed_tensor, build_indexed_dims
 from .field_space_base import (
     refine_zoom,
     coarsen_zoom,
@@ -44,9 +45,12 @@ class FieldSpaceAttentionConfig:
         token_overlap_mlp_depth: Union[List[bool], bool] = False,
         rank_variables: Union[List[int], int, None] = None,
         rank_space: Union[List[int], int, None] = None,
+        n_rank_space: Union[List[int], int, None] = None,
         rank_time: Union[List[int], int, None] = None,
         rank_depth: Union[List[int], int, None] = None,
         rank_features: Union[List[int], int, None] = None,
+        n_times: Union[List[int], int] = 1,
+        n_depths: Union[List[int], int, None] = None,
         seq_len_zoom: int = -1,
         seq_len_time: Union[List[int], int] = -1,
         seq_len_depth: Union[List[int], int] = -1,
@@ -64,11 +68,17 @@ class FieldSpaceAttentionConfig:
         use_variable_layer_norm: bool = True,
         use_variable_qkv: bool = True,
         use_variable_mlp: bool = True,
+        use_indexed_emb_layer: Optional[bool] = None,
+        use_indexed_layer_norm: Optional[bool] = None,
+        use_indexed_qkv: Optional[bool] = None,
+        use_indexed_mlp: Optional[bool] = None,
         use_ranks_emb_layer: bool = True,
         use_ranks_qkv: bool = True,
         use_ranks_mlp: bool = True,
         use_variable_att_gammas: bool = False,
         use_variable_mlp_gammas: bool = False,
+        use_indexed_att_gammas: Optional[bool] = None,
+        use_indexed_mlp_gammas: Optional[bool] = None,
         **kwargs: Any
     ) -> None:
         """
@@ -133,10 +143,13 @@ class FieldSpaceAttentionConfig:
         self.token_overlap_mlp_time: Union[List[bool], bool]
         self.token_overlap_mlp_depth: Union[List[bool], bool]
         self.rank_space: Union[List[int], int, None]
+        self.n_rank_space: Union[List[int], int, None]
         self.rank_time: Union[List[int], int, None]
         self.rank_depth: Union[List[int], int, None]
         self.rank_features: Union[List[int], int, None]
         self.rank_variables: Union[List[int], int, None]
+        self.n_times: Union[List[int], int]
+        self.n_depths: Union[List[int], int]
         self.seq_len_zoom: int
         self.seq_len_time: Union[List[int], int]
         self.seq_len_depth: Union[List[int], int]
@@ -154,15 +167,37 @@ class FieldSpaceAttentionConfig:
         self.use_variable_layer_norm: bool
         self.use_variable_qkv: bool
         self.use_variable_mlp: bool
+        self.use_indexed_emb_layer: bool
+        self.use_indexed_layer_norm: bool
+        self.use_indexed_qkv: bool
+        self.use_indexed_mlp: bool
         self.use_ranks_emb_layer: bool
         self.use_ranks_qkv: bool
         self.use_ranks_mlp: bool
         self.use_variable_att_gammas: bool
         self.use_variable_mlp_gammas: bool
+        self.use_indexed_att_gammas: bool
+        self.use_indexed_mlp_gammas: bool
+
+        def _resolve_alias(indexed_value: Optional[bool], legacy_value: bool) -> tuple[bool, bool]:
+            resolved = legacy_value if indexed_value is None else indexed_value
+            return resolved, resolved
+
+        n_depths_is_default = n_depths is None
+        n_depths = 1 if n_depths is None else n_depths
+
+        use_indexed_emb_layer, use_variable_emb_layer = _resolve_alias(use_indexed_emb_layer, use_variable_emb_layer)
+        use_indexed_layer_norm, use_variable_layer_norm = _resolve_alias(use_indexed_layer_norm, use_variable_layer_norm)
+        use_indexed_qkv, use_variable_qkv = _resolve_alias(use_indexed_qkv, use_variable_qkv)
+        use_indexed_mlp, use_variable_mlp = _resolve_alias(use_indexed_mlp, use_variable_mlp)
+        use_indexed_att_gammas, use_variable_att_gammas = _resolve_alias(use_indexed_att_gammas, use_variable_att_gammas)
+        use_indexed_mlp_gammas, use_variable_mlp_gammas = _resolve_alias(use_indexed_mlp_gammas, use_variable_mlp_gammas)
 
         inputs = copy.deepcopy(locals())
 
         for input, value in inputs.items():
+            if input in {'self', '_resolve_alias'}:
+                continue
             if input == 'kwargs':
                 for input_kw, value_kw in value.items():
                     setattr(self, input_kw, value_kw)
@@ -184,6 +219,7 @@ class FieldSpaceAttentionModule(nn.Module):
         target_zooms: Optional[List[int]] = None,
         in_features: int = 1,
         n_groups_variables: List[int] = [1],
+        n_groups_depths: Optional[List[int]] = None,
         token_len_depth: Union[List[int], int] = 1,
         token_len_time: Union[List[int], int] = 1,
         token_overlap_space: Union[List[bool], bool] = False,
@@ -193,9 +229,12 @@ class FieldSpaceAttentionModule(nn.Module):
         token_overlap_mlp_depth: Union[List[bool], bool] = False,
         rank_variables: Union[List[int], int, None] = None,
         rank_space: Union[List[int], int, None] = None,
+        n_rank_space: Union[List[int], int, None] = None,
         rank_time: Union[List[int], int, None] = None,
         rank_depth: Union[List[int], int, None] = None,
         rank_features: Union[List[int], int, None] = None,
+        n_times: Union[List[int], int] = 1,
+        n_depths: Union[List[int], int, None] = None,
         seq_len_zoom: int = -1,
         seq_len_time: Union[List[int], int] = -1,
         seq_len_depth: Union[List[int], int] = -1,
@@ -217,11 +256,17 @@ class FieldSpaceAttentionModule(nn.Module):
         use_variable_layer_norm: bool = True,
         use_variable_qkv: bool = True,
         use_variable_mlp: bool = True,
+        use_indexed_emb_layer: Optional[bool] = None,
+        use_indexed_layer_norm: Optional[bool] = None,
+        use_indexed_qkv: Optional[bool] = None,
+        use_indexed_mlp: Optional[bool] = None,
         use_ranks_emb_layer: bool = True,
         use_ranks_qkv: bool = True,
         use_ranks_mlp: bool = True,
         use_variable_att_gammas: bool = False,
         use_variable_mlp_gammas: bool = False,
+        use_indexed_att_gammas: Optional[bool] = None,
+        use_indexed_mlp_gammas: Optional[bool] = None,
         embed_confs: Dict[str, Any] = {},
         fac_mode: str = "Tucker",
         emb_aggregation: str = "shift_scale",
@@ -300,6 +345,14 @@ class FieldSpaceAttentionModule(nn.Module):
         else:
             raise ValueError("groups must be -1 or a list of bools")
 
+        if n_groups_depths is None:
+            n_groups_depths = [1] * n_groups
+        if len(n_groups_depths) != n_groups:
+            raise ValueError(f"n_groups_depths must have length {n_groups}, got {len(n_groups_depths)}")
+
+        def _resolve_alias(indexed_value: Optional[bool], legacy_value: bool) -> bool:
+            return legacy_value if indexed_value is None else indexed_value
+
         token_len_depth = check_value(token_len_depth, n_groups)
         token_len_time = check_value(token_len_time, n_groups)
 
@@ -310,10 +363,23 @@ class FieldSpaceAttentionModule(nn.Module):
         token_overlap_mlp_depth = check_value(token_overlap_mlp_depth, n_groups)
 
         rank_space = check_value(rank_space, n_groups)
+        n_rank_space = check_value(n_rank_space, n_groups)
         rank_time = check_value(rank_time, n_groups)
         rank_depth = check_value(rank_depth, n_groups)
         rank_variables = check_value(rank_variables, n_groups)
         rank_features = check_value(rank_features, n_groups)
+        n_times = check_value(n_times, n_groups)
+        if n_depths is None:
+            n_depths = list(n_groups_depths)
+        else:
+            n_depths = check_value(n_depths, n_groups)
+
+        use_indexed_emb_layer = _resolve_alias(use_indexed_emb_layer, use_variable_emb_layer)
+        use_indexed_layer_norm = _resolve_alias(use_indexed_layer_norm, use_variable_layer_norm)
+        use_indexed_qkv = _resolve_alias(use_indexed_qkv, use_variable_qkv)
+        use_indexed_mlp = _resolve_alias(use_indexed_mlp, use_variable_mlp)
+        use_indexed_att_gammas = _resolve_alias(use_indexed_att_gammas, use_variable_att_gammas)
+        use_indexed_mlp_gammas = _resolve_alias(use_indexed_mlp_gammas, use_variable_mlp_gammas)
         
 
         self.out_zooms: List[int] = copy.deepcopy(out_zooms)
@@ -380,10 +446,13 @@ class FieldSpaceAttentionModule(nn.Module):
                         token_overlap_mlp_time= token_overlap_mlp_time[k],
                         token_overlap_mlp_depth= token_overlap_mlp_depth[k],
                         rank_space = rank_space[k],
+                        n_rank_space = n_rank_space[k],
                         rank_time = rank_time[k],
                         rank_depth = rank_depth[k],
                         rank_features = rank_features[k],
                         rank_variables = rank_variables[k],
+                        n_times = n_times[k],
+                        n_depths = n_depths[k],
                         seq_len_time= seq_len_time,
                         seq_len_depth= seq_len_depth,
                         seq_overlap_space = seq_overlap_space,
@@ -404,11 +473,17 @@ class FieldSpaceAttentionModule(nn.Module):
                         use_variable_layer_norm=use_variable_layer_norm,
                         use_variable_qkv=use_variable_qkv,
                         use_variable_mlp=use_variable_mlp,
+                        use_indexed_emb_layer=use_indexed_emb_layer,
+                        use_indexed_layer_norm=use_indexed_layer_norm,
+                        use_indexed_qkv=use_indexed_qkv,
+                        use_indexed_mlp=use_indexed_mlp,
                         use_ranks_emb_layer=use_ranks_emb_layer,
                         use_ranks_qkv=use_ranks_qkv,
                         use_ranks_mlp=use_ranks_mlp,
                         use_variable_att_gammas=use_variable_att_gammas,
                         use_variable_mlp_gammas=use_variable_mlp_gammas,
+                        use_indexed_att_gammas=use_indexed_att_gammas,
+                        use_indexed_mlp_gammas=use_indexed_mlp_gammas,
                         )
             self.blocks.append(block)
 
@@ -581,10 +656,13 @@ class FieldSpaceAttentionBlock(nn.Module):
         token_overlap_mlp_time: bool = False,
         token_overlap_mlp_depth: bool = False,
         rank_space: Optional[int] = None,
+        n_rank_space: Optional[int] = None,
         rank_time: Optional[int] = None,
         rank_depth: Optional[int] = None,
         rank_features: Optional[int] = None,
         rank_variables: Optional[int] = None,
+        n_times: int = 1,
+        n_depths: int = 1,
         dropout: float = 0.0,
         n_head_channels: int = 32,
         embed_confs: Dict[str, Any] = {},
@@ -606,11 +684,17 @@ class FieldSpaceAttentionBlock(nn.Module):
         use_variable_layer_norm: bool = True,
         use_variable_qkv: bool = True,
         use_variable_mlp: bool = True,
+        use_indexed_emb_layer: Optional[bool] = None,
+        use_indexed_layer_norm: Optional[bool] = None,
+        use_indexed_qkv: Optional[bool] = None,
+        use_indexed_mlp: Optional[bool] = None,
         use_ranks_emb_layer: bool = True,
         use_ranks_qkv: bool = True,
         use_ranks_mlp: bool = True,
         use_variable_att_gammas: bool = False,
         use_variable_mlp_gammas: bool = False,
+        use_indexed_att_gammas: Optional[bool] = None,
+        use_indexed_mlp_gammas: Optional[bool] = None,
     ) -> None:
         """
         Initialize a field-space attention block.
@@ -690,6 +774,16 @@ class FieldSpaceAttentionBlock(nn.Module):
 
         emb_ranks_default = embed_confs.get("ranks", [*ranks, None])
         shared_emb_ranks = [None] * len(emb_ranks_default)
+
+        def _resolve_alias(indexed_value: Optional[bool], legacy_value: bool) -> bool:
+            return legacy_value if indexed_value is None else indexed_value
+
+        use_indexed_emb_layer = _resolve_alias(use_indexed_emb_layer, use_variable_emb_layer)
+        use_indexed_layer_norm = _resolve_alias(use_indexed_layer_norm, use_variable_layer_norm)
+        use_indexed_qkv = _resolve_alias(use_indexed_qkv, use_variable_qkv)
+        use_indexed_mlp = _resolve_alias(use_indexed_mlp, use_variable_mlp)
+        use_indexed_att_gammas = _resolve_alias(use_indexed_att_gammas, use_variable_att_gammas)
+        use_indexed_mlp_gammas = _resolve_alias(use_indexed_mlp_gammas, use_variable_mlp_gammas)
 
         n_variables_emb = n_variables if use_variable_emb_layer else 1
         n_variables_norm = n_variables if use_variable_layer_norm else 1
@@ -802,6 +896,74 @@ class FieldSpaceAttentionBlock(nn.Module):
         emb_tokenizer_out_features = copy.deepcopy(self.token_size_space)
         emb_tokenizer_out_features[1] = self.token_size_space[1] if embedder and embedder.has_space() else 1
 
+        def _build_branch_indexed_dims(
+            *,
+            n_variables_local: int = 1,
+            rank_variables_local: Optional[int] = None,
+            include_indexing: bool = True,
+        ) -> Dict[str, Dict[str, Any]]:
+            if not include_indexing:
+                return {}
+
+            indexed_n_depths = max(1, int(n_depths) // max(1, int(token_len_depth))) if int(n_depths) > 1 else 1
+            indexed_n_space = 12 * 4**int(token_zoom) if n_rank_space is not None and int(n_rank_space) > 0 and int(token_zoom) >= 0 else 1
+            indexed_rank_space = int(n_rank_space) if indexed_n_space > 1 else None
+
+            return build_indexed_dims(
+                n_variables=int(n_variables_local),
+                rank_variables=rank_variables_local,
+                n_times=int(n_times) if int(n_times) > 1 else 1,
+                n_space=indexed_n_space,
+                rank_space=indexed_rank_space,
+                n_depths=indexed_n_depths,
+            )
+
+        indexed_dims_emb = _build_branch_indexed_dims(
+            n_variables_local=n_variables if use_variable_emb_layer else 1,
+            rank_variables_local=rank_variables if use_ranks_emb_layer else None,
+            include_indexing=use_indexed_emb_layer,
+        )
+        indexed_dims_norm = _build_branch_indexed_dims(
+            n_variables_local=n_variables if use_variable_layer_norm else 1,
+            rank_variables_local=None,
+            include_indexing=use_indexed_layer_norm,
+        )
+        indexed_dims_emb_kv = _build_branch_indexed_dims(
+            n_variables_local=n_variables if use_variable_emb_layer else 1,
+            rank_variables_local=rank_variables if use_ranks_emb_layer else None,
+            include_indexing=use_indexed_emb_layer,
+        )
+        indexed_dims_norm_kv = _build_branch_indexed_dims(
+            n_variables_local=n_variables if use_variable_layer_norm else 1,
+            rank_variables_local=None,
+            include_indexing=use_indexed_layer_norm,
+        )
+        indexed_dims_qkv = _build_branch_indexed_dims(
+            n_variables_local=n_variables if use_variable_qkv else 1,
+            rank_variables_local=rank_variables_qkv,
+            include_indexing=use_indexed_qkv,
+        )
+        indexed_dims_kv = _build_branch_indexed_dims(
+            n_variables_local=n_variables if use_variable_qkv else 1,
+            rank_variables_local=rank_variables_qkv,
+            include_indexing=use_indexed_qkv,
+        )
+        indexed_dims_mlp = _build_branch_indexed_dims(
+            n_variables_local=n_variables if use_variable_mlp else 1,
+            rank_variables_local=None,
+            include_indexing=use_indexed_mlp,
+        )
+        self.indexed_dims_att_gammas = _build_branch_indexed_dims(
+            n_variables_local=n_variables,
+            rank_variables_local=None,
+            include_indexing=use_indexed_att_gammas,
+        )
+        self.indexed_dims_mlp_gammas = _build_branch_indexed_dims(
+            n_variables_local=n_variables,
+            rank_variables_local=None,
+            include_indexing=use_indexed_mlp_gammas,
+        )
+
         # Embed Q with optional positional/field embedding layer.
         self.emb_layer_q_field: LinEmbLayer = LinEmbLayer(
             emb_tokenizer_out_features,
@@ -809,6 +971,8 @@ class FieldSpaceAttentionBlock(nn.Module):
             ranks=ranks_emb,
             n_variables=n_variables_emb,
             n_variable_norm=n_variables_norm,
+            indexed_dims=indexed_dims_emb,
+            indexed_dims_norm=indexed_dims_norm,
             fac_mode=fac_mode,
             identity_if_equal=True,
             embedder=embedder,
@@ -827,6 +991,8 @@ class FieldSpaceAttentionBlock(nn.Module):
                 ranks=ranks_emb,
                 n_variables=n_variables_emb,
                 n_variable_norm=n_variables_norm,
+                indexed_dims=indexed_dims_emb,
+                indexed_dims_norm=indexed_dims_norm,
                 fac_mode=fac_mode,
                 identity_if_equal=True,
                 embedder=embedder,
@@ -847,6 +1013,8 @@ class FieldSpaceAttentionBlock(nn.Module):
                 ranks=ranks_emb,
                 n_variables=n_variables_emb,
                 n_variable_norm=n_variables_norm,
+                indexed_dims=indexed_dims_emb_kv,
+                indexed_dims_norm=indexed_dims_norm_kv,
                 fac_mode=fac_mode,
                 identity_if_equal=True,
                 embedder=embedder,
@@ -866,15 +1034,18 @@ class FieldSpaceAttentionBlock(nn.Module):
         update_dims_mlp = [*self.token_size_update[:-1], update_dim]
 
         # Linear projections into attention space.
-        self.q_projection_layer = get_layer(token_size_in_overlap, out_dim_q, ranks=ranks_qkv, n_variables=n_variables_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv, bias=False)
-        self.kv_projection_layer = get_layer(token_size_in_kv_overlap, out_dim_kv, ranks=ranks_qkv, n_variables=n_variables_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv, bias=True)
-        self.out_layer_att = get_layer(out_dim_q, update_dims, ranks=ranks_qkv, n_variables=n_variables_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv)
+        self.q_projection_layer = get_layer(token_size_in_overlap, out_dim_q, ranks=ranks_qkv, n_variables=n_variables_qkv, indexed_dims=indexed_dims_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv, bias=False)
+        self.kv_projection_layer = get_layer(token_size_in_kv_overlap, out_dim_kv, ranks=ranks_qkv, n_variables=n_variables_qkv, indexed_dims=indexed_dims_kv, fac_mode=fac_mode, rank_variables=rank_variables_qkv, bias=True)
+        self.out_layer_att = get_layer(out_dim_q, update_dims, ranks=ranks_qkv, n_variables=n_variables_qkv, indexed_dims=indexed_dims_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv)
 
         # Learned residual scaling for attention and MLP updates.
         self.use_variable_att_gammas: bool = use_variable_att_gammas
         self.use_variable_mlp_gammas: bool = use_variable_mlp_gammas
+        self.use_indexed_att_gammas: bool = use_indexed_att_gammas
+        self.use_indexed_mlp_gammas: bool = use_indexed_mlp_gammas
 
-        gamma_shape_att = [n_variables, *self.token_size_space] if use_variable_att_gammas else self.token_size_space
+        gamma_indexed_shape_att = [spec["n_features"] for spec in self.indexed_dims_att_gammas.values()]
+        gamma_shape_att = [*gamma_indexed_shape_att, *self.token_size_space] if use_indexed_att_gammas else self.token_size_space
         self.gamma_res = nn.Parameter(torch.ones(gamma_shape_att) * 1e-12, requires_grad=True)
         self.gamma = nn.Parameter(torch.ones(gamma_shape_att) * 1e-12, requires_grad=True)
 
@@ -885,10 +1056,12 @@ class FieldSpaceAttentionBlock(nn.Module):
             dropout=dropout,
             ranks=ranks_mlp,
             n_variables=n_variables_mlp,
+            indexed_dims=indexed_dims_mlp,
             fac_mode=fac_mode,
             gamma=False,
         )
-        gamma_shape_mlp = [len(target_zooms), n_variables] if use_variable_mlp_gammas else [len(target_zooms)]
+        gamma_indexed_shape_mlp = [spec["n_features"] for spec in self.indexed_dims_mlp_gammas.values()]
+        gamma_shape_mlp = [len(target_zooms), *gamma_indexed_shape_mlp] if use_indexed_mlp_gammas else [len(target_zooms)]
         self.gamma_res_mlp = nn.Parameter(torch.ones(gamma_shape_mlp) * 1e-12, requires_grad=True)
         self.gamma_mlp = nn.Parameter(torch.ones(gamma_shape_mlp) * 1e-12, requires_grad=True)
 
@@ -1004,34 +1177,47 @@ class FieldSpaceAttentionBlock(nn.Module):
 
         return emb_cpy
 
-    def _get_att_gamma(self, gamma: torch.Tensor, emb: Optional[Dict[str, Any]]) -> torch.Tensor:
+    def _get_att_gamma(
+        self,
+        gamma: torch.Tensor,
+        reference: torch.Tensor,
+        emb: Optional[Dict[str, Any]],
+    ) -> torch.Tensor:
         """
         Select and broadcast attention residual gammas.
 
         :param gamma: Shared gamma of shape ``(t, n, d, f)`` or variable-specific gamma of
             shape ``(n_variables, t, n, d, f)``.
+        :param reference: Reference tensor defining the target broadcast shape.
         :param emb: Optional embedding dict containing variable indices.
         :return: Gamma broadcastable to ``(b, v, T, N, D, t, n, d, f)``.
         """
-        if not self.use_variable_att_gammas:
+        if not self.use_indexed_att_gammas:
             return gamma
 
-        return gamma[_get_layer_variable_indices(emb)].unsqueeze(2).unsqueeze(2).unsqueeze(2)
+        return broadcast_indexed_tensor(gamma, self.indexed_dims_att_gammas, reference, emb=emb)
 
-    def _get_mlp_gamma(self, gamma: torch.Tensor, idx: int, emb: Optional[Dict[str, Any]]) -> torch.Tensor:
+    def _get_mlp_gamma(
+        self,
+        gamma: torch.Tensor,
+        idx: int,
+        reference: torch.Tensor,
+        emb: Optional[Dict[str, Any]],
+    ) -> torch.Tensor:
         """
         Select and broadcast MLP residual gammas.
 
         :param gamma: Shared gamma of shape ``(n_zooms,)`` or variable-specific gamma of
             shape ``(n_zooms, n_variables)``.
         :param idx: Target zoom index.
+        :param reference: Reference tensor defining the target broadcast shape.
         :param emb: Optional embedding dict containing variable indices.
         :return: Gamma broadcastable to ``(b, v, t, n, d, f)``.
         """
-        if not self.use_variable_mlp_gammas:
+        if not self.use_indexed_mlp_gammas:
             return gamma[idx]
 
-        return gamma[idx][_get_layer_variable_indices(emb)].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        return broadcast_indexed_tensor(gamma[idx], self.indexed_dims_mlp_gammas, reference, emb=emb)
     
     def create_QKV(
         self,
@@ -1192,8 +1378,8 @@ class FieldSpaceAttentionBlock(nn.Module):
 
         # Project attention output back to update dimension.
         att_out = self.out_layer_att(att_out, emb=emb_tokenized, sample_configs=sample_configs)
-        gamma_res_att = self._get_att_gamma(self.gamma_res, emb_tokenized)
-        gamma_att = self._get_att_gamma(self.gamma, emb_tokenized)
+        gamma_res_att = self._get_att_gamma(self.gamma_res, x_base, emb_tokenized)
+        gamma_att = self._get_att_gamma(self.gamma, x_base, emb_tokenized)
         if self.scale_shift:
             scale, shift = self.dropout_att(att_out).chunk(2, dim=-1)
             # Apply scale/shift residual update.
@@ -1228,8 +1414,8 @@ class FieldSpaceAttentionBlock(nn.Module):
         for k, (zoom, n) in enumerate(self.n_out_features_update.items()):
             if x_zooms and x is not None:
                 x_out = rearrange(x[k], self.pattern_tokens_reverse, n=n)
-                gamma_res_mlp = self._get_mlp_gamma(self.gamma_res_mlp, k, emb_tokenized)
-                gamma_mlp = self._get_mlp_gamma(self.gamma_mlp, k, emb_tokenized)
+                gamma_res_mlp = self._get_mlp_gamma(self.gamma_res_mlp, k, x_zooms[zoom], emb_tokenized)
+                gamma_mlp = self._get_mlp_gamma(self.gamma_mlp, k, x_zooms[zoom], emb_tokenized)
                 residual_base = residual_bases[zoom] if residual_bases is not None else x_zooms[zoom]
 
                 if self.scale_shift:

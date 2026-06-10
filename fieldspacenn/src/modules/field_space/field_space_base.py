@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import string
 
@@ -269,6 +269,7 @@ class EmbLayer(nn.Module):
         emb_aggregation: str = "shift_scale",
         emb_ranks: Optional[List[Optional[int]]] = None,
         n_variables: int = 1,
+        indexed_dims: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
         fac_mode: str = "Tucker",
         spatial_dim_count: int = 1,
         field_tokenizer: Optional[Tokenizer] = None,
@@ -317,20 +318,21 @@ class EmbLayer(nn.Module):
                 [*out_features_, 2],
                 ranks=ranks,
                 n_variables=n_variables,
+                indexed_dims=indexed_dims,
                 fac_mode=fac_mode,
             )
             self.forward_fcn = self.forward_w_shift_scale
 
         elif aggregation == 'shift':
-            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, fac_mode=fac_mode)
+            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_shift
         
         elif aggregation == 'scale':
-            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, fac_mode=fac_mode)
+            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_scale
 
         elif aggregation == 'concat':
-            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, fac_mode=fac_mode)
+            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_concat
 
         self.aggregation: str = aggregation
@@ -462,6 +464,8 @@ class LinEmbLayer(nn.Module):
         emb_ranks: Optional[List[Optional[int]]] = None,
         n_variables: int = 1,
         n_variable_norm: int = 1,
+        indexed_dims: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+        indexed_dims_norm: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
         fac_mode: str = "Tucker",
         emb_aggregation: str = "shift_scale",
         embedder: Optional[Any] = None,
@@ -511,6 +515,7 @@ class LinEmbLayer(nn.Module):
                                             emb_aggregation=emb_aggregation,
                                             emb_ranks=emb_ranks,
                                             n_variables=n_variables,
+                                            indexed_dims=indexed_dims,
                                             fac_mode=fac_mode,
                                             spatial_dim_count=spatial_dim_count,
                                             field_tokenizer = field_tokenizer,
@@ -524,14 +529,26 @@ class LinEmbLayer(nn.Module):
             self.embedding_layer = IdentityLayer()
 
         if layer_norm:
-            self.layer_norm = LayerNorm(out_features_, elementwise_affine=True, n_variables=n_variable_norm)
+            self.layer_norm = LayerNorm(
+                out_features_,
+                elementwise_affine=True,
+                n_variables=n_variable_norm,
+                indexed_dims=indexed_dims_norm,
+            )
         else:
             self.layer_norm = IdentityLayer()
 
         if identity_if_equal and (torch.tensor(in_features_)-torch.tensor(out_features_)==0).all():
             self.layer: nn.Module = IdentityLayer()
         else:
-            self.layer = get_layer(in_features_, out_features_, ranks=ranks, n_variables=n_variables, fac_mode=fac_mode)
+            self.layer = get_layer(
+                in_features_,
+                out_features_,
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode,
+            )
 
 
     def forward(

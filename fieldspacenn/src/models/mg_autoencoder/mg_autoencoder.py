@@ -54,7 +54,14 @@ class MG_AutoEncoder(MG_base_model):
         # Build encoder blocks, tracking output feature/zoom changes.
         for block_key, block_conf in encoder_block_configs.items():
             assert isinstance(block_key, str), "block keys should be strings"
-            block = create_encoder_decoder_block(block_conf, in_zooms, in_features, n_groups_variables, self.grid_layers, **kwargs)
+            block = create_encoder_decoder_block(
+                block_conf,
+                in_zooms,
+                in_features,
+                n_groups_variables,
+                grid_layers=self.grid_layers,
+                **kwargs,
+            )
 
             self.encoder_blocks[block_key] = block
 
@@ -66,7 +73,14 @@ class MG_AutoEncoder(MG_base_model):
         # Build decoder blocks, tracking output feature/zoom changes.
         for block_key, block_conf in decoder_block_configs.items():
             assert isinstance(block_key, str), "block keys should be strings"
-            block = create_encoder_decoder_block(block_conf, in_zooms, in_features, n_groups_variables, self.grid_layers, **kwargs)
+            block = create_encoder_decoder_block(
+                block_conf,
+                in_zooms,
+                in_features,
+                n_groups_variables,
+                grid_layers=self.grid_layers,
+                **kwargs,
+            )
             self.decoder_blocks[block_key] = block
 
             in_features = block.out_features

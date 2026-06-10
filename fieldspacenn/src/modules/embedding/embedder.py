@@ -935,6 +935,23 @@ class EmbedderSequential(nn.Module):
         self.spatial_dim_count: int = spatial_dim_count
         self.activation: nn.Module = nn.Identity()
 
+    @staticmethod
+    def _get_variable_embedder_size(inputs: Dict[str, Any]) -> Optional[int]:
+        """
+        Infer the runtime variable axis size from the variable embedder input.
+
+        :param inputs: Embedding input mapping passed to the sequential embedder.
+        :return: Number of runtime variables if available, otherwise None.
+        """
+        var_input = inputs.get("VariableEmbedder", inputs.get("variables_sampled"))
+        if not isinstance(var_input, torch.Tensor):
+            return None
+        if var_input.ndim == 0:
+            return 1
+        if var_input.ndim == 1:
+            return int(var_input.shape[0])
+        return int(var_input.shape[1])
+
     def get_embedding_dims(self) -> List[str]:
         """
         Collect all dimension labels used by the active embedders.
@@ -994,6 +1011,7 @@ class EmbedderSequential(nn.Module):
         :return: Combined embedding tensor with shape ``(b, v, t, s, c)``.
         """
         embeddings = []
+        variable_embedder_size = self._get_variable_embedder_size(inputs)
 
         # Apply each embedder to its respective input
         for embedder_name, embedder in self.embedders.items():
@@ -1012,6 +1030,12 @@ class EmbedderSequential(nn.Module):
 
             # Reshape the output to the target output_shape
             embed_output = expand_tensor(embed_output, dims=4 + self.spatial_dim_count, keep_dims=embedder.keep_dims)
+            if variable_embedder_size is not None and embed_output.shape[1] == 1 and variable_embedder_size > 1:
+                embed_output = embed_output.expand(
+                    embed_output.shape[0],
+                    variable_embedder_size,
+                    *embed_output.shape[2:],
+                )
             embeddings.append(embed_output)
 
         # Combine embeddings according to the mode

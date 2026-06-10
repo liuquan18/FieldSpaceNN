@@ -698,7 +698,15 @@ class StaticVariableFieldReshaper(nn.Module):
 
 class StaticVariableEmbedder(ZoomBaseEmbedder):
 
-    def __init__(self, name: str, in_channels: int, embed_dim: int, zoom: int, **kwargs) -> None:
+    def __init__(
+        self,
+        name: str,
+        in_channels: int,
+        embed_dim: int,
+        zoom: int,
+        grid_layers: Optional[Dict[str, GridLayer]] = None,
+        **kwargs: Any,
+    ) -> None:
         """
         Initialize the static variable embedder.
 
@@ -706,6 +714,7 @@ class StaticVariableEmbedder(ZoomBaseEmbedder):
         :param in_channels: Number of input features.
         :param embed_dim: Dimensionality of the embedding output.
         :param zoom: Zoom level this embedder operates on.
+        :param grid_layers: Optional grid layers used to gather spatial neighborhoods.
         :param kwargs: Additional keyword arguments (unused).
         :return: None.
         """
@@ -714,12 +723,57 @@ class StaticVariableEmbedder(ZoomBaseEmbedder):
         self.keep_dims: List[str] = ["b", "t", "s", "c"]
 
         self.zoom: int = zoom
+        self.grid_layers: Dict[str, GridLayer] = {} if grid_layers is None else grid_layers
+        self.nh_size: int = 1
+        if str(self.zoom) in self.grid_layers:
+            self.nh_size = int(self.grid_layers[str(self.zoom)].adjc.shape[-1])
 
         self.embedding_fn: nn.Module = nn.Sequential(
-            nn.Linear(self.in_channels, self.embed_dim),
+            nn.Linear(self.in_channels * self.nh_size, self.embed_dim),
             nn.SiLU(),
             nn.Linear(self.embed_dim, self.embed_dim),
         )
+
+    def forward(
+        self,
+        emb: Dict[int, torch.Tensor],
+        output_zoom: Optional[int] = None,
+        sample_configs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """
+        Embed static variables after augmenting each cell with its local neighborhood.
+
+        :param emb: Mapping of zoom to tensors shaped like ``(b, t, n, f)``.
+        :param output_zoom: Optional output zoom level.
+        :param sample_configs: Optional sampling configuration dictionary.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: Embedded tensor of shape ``(b, t, n, embed_dim)``.
+        """
+        zoom = output_zoom if output_zoom is not None and output_zoom in emb else self.zoom
+        emb_zoom = emb[zoom]
+
+        if emb_zoom.ndim == 3:
+            emb_zoom = emb_zoom.unsqueeze(1)
+
+        grid_layer = self.grid_layers[str(zoom)]
+        if grid_layer is None:
+            return self.embedding_fn(emb_zoom)
+
+        if sample_configs is None:
+            sample_config = {}
+            if emb_zoom.shape[-2] != grid_layer.adjc.shape[0]:
+                raise ValueError(
+                    "`StaticVariableEmbedder` requires `sample_configs` for patch-local inputs "
+                    "when neighborhood features are enabled."
+                )
+        else:
+            sample_config = sample_configs.get(zoom, {})
+
+        emb_zoom_nh, _ = grid_layer.get_nh(emb_zoom.unsqueeze(1), **sample_config)
+        emb_zoom_nh = rearrange(emb_zoom_nh, "b 1 t s nh f -> b t s (nh f)")
+
+        return self.embedding_fn(emb_zoom_nh)
 
 
 class MaskEmbedder(BaseEmbedder):

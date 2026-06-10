@@ -20,6 +20,9 @@ class MG_Transformer(MG_base_model):
         in_features: int = 1,
         n_groups_variables: Sequence[int] = [1],
         n_groups_depths: Optional[Sequence[int]] = None,
+        shared_indexed_group_variables: Optional[Sequence[bool]] = None,
+        shared_indexed_group_depths: Optional[Sequence[bool]] = None,
+        shared_indexed_group_space: Optional[Sequence[bool]] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -40,6 +43,21 @@ class MG_Transformer(MG_base_model):
         self.n_groups_depths: Sequence[int] = (
             list(n_groups_depths) if n_groups_depths is not None else [1] * len(n_groups_variables)
         )
+        self.shared_indexed_group_variables: Sequence[bool] = (
+            list(shared_indexed_group_variables)
+            if shared_indexed_group_variables is not None
+            else [False] * len(n_groups_variables)
+        )
+        self.shared_indexed_group_depths: Sequence[bool] = (
+            list(shared_indexed_group_depths)
+            if shared_indexed_group_depths is not None
+            else [False] * len(n_groups_variables)
+        )
+        self.shared_indexed_group_space: Sequence[bool] = (
+            list(shared_indexed_group_space)
+            if shared_indexed_group_space is not None
+            else [False] * len(n_groups_variables)
+        )
 
         self.Blocks: nn.ModuleDict = nn.ModuleDict()
 
@@ -54,6 +72,9 @@ class MG_Transformer(MG_base_model):
                 n_groups_variables,
                 self.grid_layers,
                 self.n_groups_depths,
+                self.shared_indexed_group_variables,
+                self.shared_indexed_group_depths,
+                self.shared_indexed_group_space,
             )
 
             self.Blocks[block_key] = block

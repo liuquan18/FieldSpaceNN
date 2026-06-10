@@ -220,6 +220,9 @@ class FieldSpaceAttentionModule(nn.Module):
         in_features: int = 1,
         n_groups_variables: List[int] = [1],
         n_groups_depths: Optional[List[int]] = None,
+        shared_indexed_group_variables: Union[List[bool], bool] = False,
+        shared_indexed_group_depths: Union[List[bool], bool] = False,
+        shared_indexed_group_space: Union[List[bool], bool] = False,
         token_len_depth: Union[List[int], int] = 1,
         token_len_time: Union[List[int], int] = 1,
         token_overlap_space: Union[List[bool], bool] = False,
@@ -349,6 +352,9 @@ class FieldSpaceAttentionModule(nn.Module):
             n_groups_depths = [1] * n_groups
         if len(n_groups_depths) != n_groups:
             raise ValueError(f"n_groups_depths must have length {n_groups}, got {len(n_groups_depths)}")
+        shared_indexed_group_variables = check_value(shared_indexed_group_variables, n_groups)
+        shared_indexed_group_depths = check_value(shared_indexed_group_depths, n_groups)
+        shared_indexed_group_space = check_value(shared_indexed_group_space, n_groups)
 
         def _resolve_alias(indexed_value: Optional[bool], legacy_value: bool) -> bool:
             return legacy_value if indexed_value is None else indexed_value
@@ -445,6 +451,9 @@ class FieldSpaceAttentionModule(nn.Module):
                         token_overlap_depth= token_overlap_depth[k],
                         token_overlap_mlp_time= token_overlap_mlp_time[k],
                         token_overlap_mlp_depth= token_overlap_mlp_depth[k],
+                        shared_indexed_variables=shared_indexed_group_variables[k],
+                        shared_indexed_depths=shared_indexed_group_depths[k],
+                        shared_indexed_space=shared_indexed_group_space[k],
                         rank_space = rank_space[k],
                         n_rank_space = n_rank_space[k],
                         rank_time = rank_time[k],
@@ -655,6 +664,9 @@ class FieldSpaceAttentionBlock(nn.Module):
         token_overlap_depth: bool = False,
         token_overlap_mlp_time: bool = False,
         token_overlap_mlp_depth: bool = False,
+        shared_indexed_variables: bool = False,
+        shared_indexed_depths: bool = False,
+        shared_indexed_space: bool = False,
         rank_space: Optional[int] = None,
         n_rank_space: Optional[int] = None,
         rank_time: Optional[int] = None,
@@ -912,10 +924,13 @@ class FieldSpaceAttentionBlock(nn.Module):
             return build_indexed_dims(
                 n_variables=int(n_variables_local),
                 rank_variables=rank_variables_local,
+                same_values_variables=shared_indexed_variables,
                 n_times=int(n_times) if int(n_times) > 1 else 1,
                 n_space=indexed_n_space,
                 rank_space=indexed_rank_space,
+                same_values_space=shared_indexed_space,
                 n_depths=indexed_n_depths,
+                same_values_depths=shared_indexed_depths,
             )
 
         indexed_dims_emb = _build_branch_indexed_dims(

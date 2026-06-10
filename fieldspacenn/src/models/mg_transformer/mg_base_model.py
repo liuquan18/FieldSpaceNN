@@ -169,6 +169,9 @@ def create_encoder_decoder_block(
     n_groups_variables: Sequence[int],
     grid_layers: nn.ModuleDict,
     n_groups_depths: Optional[Sequence[int]] = None,
+    shared_indexed_group_variables: Optional[Sequence[bool]] = None,
+    shared_indexed_group_depths: Optional[Sequence[bool]] = None,
+    shared_indexed_group_space: Optional[Sequence[bool]] = None,
     **kwargs: Any,
 ) -> nn.Module:
     """
@@ -192,6 +195,12 @@ def create_encoder_decoder_block(
     att_dim = check_get([block_conf,kwargs,defaults], "att_dim")
     if n_groups_depths is None:
         n_groups_depths = [1] * len(n_groups_variables)
+    if shared_indexed_group_variables is None:
+        shared_indexed_group_variables = [False] * len(n_groups_variables)
+    if shared_indexed_group_depths is None:
+        shared_indexed_group_depths = [False] * len(n_groups_variables)
+    if shared_indexed_group_space is None:
+        shared_indexed_group_space = [False] * len(n_groups_variables)
 
     # Select the correct block implementation based on the config type.
     if isinstance(block_conf, ConservativeLayerConfig):
@@ -227,6 +236,9 @@ def create_encoder_decoder_block(
                 att_dim = att_dim,
                 n_groups_variables = n_groups_variables,
                 n_groups_depths = list(n_groups_depths),
+                shared_indexed_group_variables = list(shared_indexed_group_variables),
+                shared_indexed_group_depths = list(shared_indexed_group_depths),
+                shared_indexed_group_space = list(shared_indexed_group_space),
                 token_len_time = block_conf.token_len_time,
                 token_len_depth = block_conf.token_len_depth,
                 token_overlap_space = block_conf.token_overlap_space,

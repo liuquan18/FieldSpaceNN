@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 AXIS_ORDER: tuple[str, ...] = ("v", "t", "n", "d")
@@ -45,22 +46,26 @@ def _ensure_int_or_none(value: Optional[Union[int, float]]) -> Optional[int]:
 def build_indexed_dims(
     n_variables: int = 1,
     rank_variables: Optional[int] = None,
+    same_values_variables: bool = False,
     n_times: int = 1,
     rank_time: Optional[int] = None,
+    same_values_times: bool = False,
     n_space: int = 1,
     rank_space: Optional[int] = None,
+    same_values_space: bool = False,
     n_depths: int = 1,
     rank_depth: Optional[int] = None,
+    same_values_depths: bool = False,
 ) -> "OrderedDict[str, Dict[str, Any]]":
     indexed_dims: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
     values = {
-        "v": (n_variables, rank_variables, True),
-        "t": (n_times, rank_time, False),
-        "n": (n_space, rank_space, False),
-        "d": (n_depths, rank_depth, False),
+        "v": (n_variables, rank_variables, True, same_values_variables),
+        "t": (n_times, rank_time, False, same_values_times),
+        "n": (n_space, rank_space, False, same_values_space),
+        "d": (n_depths, rank_depth, False, same_values_depths),
     }
     for axis in AXIS_ORDER:
-        n_features, rank, use_emb_indices = values[axis]
+        n_features, rank, use_emb_indices, same_values = values[axis]
         n_features = int(n_features)
         if n_features <= 1:
             continue
@@ -69,6 +74,7 @@ def build_indexed_dims(
             "n_features": n_features,
             "rank": _ensure_int_or_none(rank),
             "use_emb_indices": use_emb_indices,
+            "same_values": bool(same_values),
         }
     return indexed_dims
 
@@ -99,6 +105,7 @@ def normalize_indexed_dims(
         spec["n_features"] = int(spec["n_features"])
         spec["rank"] = _ensure_int_or_none(spec.get("rank"))
         spec["use_emb_indices"] = bool(spec.get("use_emb_indices", axis == "v"))
+        spec["same_values"] = bool(spec.get("same_values", False))
 
         if spec["dim"] != AXIS_TO_DIM[axis]:
             raise ValueError(
@@ -237,6 +244,32 @@ def get_fac_matrix(dim: int, rank: Union[int, float]):
     return nn.Parameter(m, requires_grad=True)
 
 
+def get_indexed_fac_matrix(
+    dim: int,
+    rank: Union[int, float],
+    same_values: bool = False,
+):
+    """
+    Initialize an indexed factor matrix with row-wise normalization over rank only.
+
+    :param dim: Number of indexed entries.
+    :param rank: Factorization rank.
+    :param same_values: Whether every indexed entry should share the same row values.
+    :return: Learnable parameter matrix of shape ``(dim, rank)``.
+    """
+    if isinstance(rank, float):
+        rank = int(rank * dim)
+
+    rank = int(max(rank, 1))
+    if same_values:
+        row = F.normalize(torch.ones(1, rank), dim=-1)
+        m = row.expand(dim, -1).clone()
+    else:
+        m = F.normalize(torch.randn(dim, rank), dim=-1)
+
+    return nn.Parameter(m, requires_grad=True)
+
+
 class TuckerFacLayer(nn.Module):
     """
     Tucker factorization layer supporting indexed tensor dimensions.
@@ -312,7 +345,11 @@ class TuckerFacLayer(nn.Module):
             rank = spec["rank"]
             if rank is not None and rank > 0:
                 rank_letter = next(self.core_letters)
-                factor = get_fac_matrix(int(spec["n_features"]), min(int(spec["n_features"]), int(rank)))
+                factor = get_indexed_fac_matrix(
+                    int(spec["n_features"]),
+                    min(int(spec["n_features"]), int(rank)),
+                    same_values=bool(spec.get("same_values", False)),
+                )
                 self.indexed_factors.append(factor)
                 self.indexed_factor_subscripts.append(self.prefix_subscripts + rank_letter)
                 self.indexed_rank_subscripts += rank_letter

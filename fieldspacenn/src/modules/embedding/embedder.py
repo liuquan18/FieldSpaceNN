@@ -101,17 +101,7 @@ class ZoomBaseEmbedder(nn.Module):
             expanded to ``embed_dim``.
         """
         # Apply the embedder to the input tensor
-        emb = emb[self.zoom]
-
-        if output_zoom is not None and output_zoom != self.zoom and 't' in self.keep_dims:
-            t_dim =  2 - int('v' in self.keep_dims) - int('b' in self.keep_dims)
-
-            ts_start = sample_configs[self.zoom]['n_past_ts'] - sample_configs[output_zoom]['n_past_ts']
-            ts_end = sample_configs[self.zoom]['n_future_ts'] - sample_configs[output_zoom]['n_future_ts']
-
-            nt = emb.shape[t_dim]
-
-            emb = torch.index_select(emb, dim=t_dim, index=torch.arange(ts_start, nt - ts_end, device=emb.device))
+        emb = emb[output_zoom] if output_zoom is not None and output_zoom in emb else emb[self.zoom]
         
         return self.embedding_fn(emb)
 
@@ -194,17 +184,7 @@ class TimeIndexEmbedder(ZoomBaseEmbedder):
         sample_configs: Optional[Dict[str, Any]] = None,
         **kwargs: Any
     ) -> torch.Tensor:
-        emb_zoom = emb[self.zoom]
-
-        if output_zoom is not None and output_zoom != self.zoom and "t" in self.keep_dims:
-            ts_start = sample_configs[self.zoom]["n_past_ts"] - sample_configs[output_zoom]["n_past_ts"]
-            ts_end = sample_configs[self.zoom]["n_future_ts"] - sample_configs[output_zoom]["n_future_ts"]
-            nt = emb_zoom.shape[1]
-            emb_zoom = torch.index_select(
-                emb_zoom,
-                dim=1,
-                index=torch.arange(ts_start, nt - ts_end, device=emb_zoom.device),
-            )
+        emb_zoom = emb[output_zoom] if output_zoom is not None and output_zoom in emb else emb[self.zoom]
 
         batch_size = emb_zoom.shape[0]
         n_time = emb_zoom.shape[1]
@@ -297,17 +277,7 @@ class TimeProgressEmbedder(ZoomBaseEmbedder):
         sample_configs: Optional[Dict[str, Any]] = None,
         **kwargs: Any
     ) -> torch.Tensor:
-        emb_zoom = emb[self.zoom]
-
-        if output_zoom is not None and output_zoom != self.zoom and "t" in self.keep_dims:
-            ts_start = sample_configs[self.zoom]["n_past_ts"] - sample_configs[output_zoom]["n_past_ts"]
-            ts_end = sample_configs[self.zoom]["n_future_ts"] - sample_configs[output_zoom]["n_future_ts"]
-            nt = emb_zoom.shape[1]
-            emb_zoom = torch.index_select(
-                emb_zoom,
-                dim=1,
-                index=torch.arange(ts_start, nt - ts_end, device=emb_zoom.device),
-            )
+        emb_zoom = emb[output_zoom] if output_zoom is not None and output_zoom in emb else emb[self.zoom]
 
         if emb_zoom.ndim == 3:
             emb_zoom = emb_zoom.unsqueeze(2)

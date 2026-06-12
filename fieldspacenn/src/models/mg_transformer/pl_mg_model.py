@@ -25,9 +25,11 @@ class LightningMGModel(pl.LightningModule):
         Initialize the Lightning wrapper for multi-grid transformer models.
 
         :param model: Multi-grid model instance.
-        :param lr_groups: Optimizer parameter-group configuration.
+        :param lr_groups: Optimizer parameter-group configuration, including optional
+            per-group optimizer settings such as ``weight_decay`` and match rules
+            for module classes or module names.
         :param lambda_loss_dict: Loss weighting dictionary.
-        :param weight_decay: Weight decay applied in the optimizer.
+        :param weight_decay: Fallback weight decay for groups that do not define one.
         :return: None.
         """
         
@@ -594,55 +596,81 @@ class LightningMGModel(pl.LightningModule):
 
         :return: Optimizer and scheduler configuration for Lightning.
         """
+        if "default" not in self.lr_groups:
+            raise ValueError("`lr_groups` must define a `default` group for unmatched parameters.")
+
         grouped_params = {group_name: [] for group_name in self.lr_groups}
-        grouped_params["default"] = []  # fallback group
-        seen_params = set()
-        
-        class_names = []
-        def visit_module(module):
-            # Match this module by class name
+
+        modules_by_path = dict(self.named_modules())
+
+        def _normalize_match_keys(match_keys: Any) -> List[str]:
+            if match_keys is None:
+                return []
+            if isinstance(match_keys, str):
+                return [match_keys]
+            return [str(match_key) for match_key in match_keys]
+
+        def matches_group(
+            module: nn.Module,
+            module_path: str,
+            parameter_name: str,
+            group_name: str,
+            group_cfg: Mapping[str, Any],
+        ) -> bool:
+            class_match_keys = _normalize_match_keys(group_cfg.get("matches", [group_name]))
+            module_name_match_keys = _normalize_match_keys(group_cfg.get("module_name_matches"))
+            parameter_name_match_keys = _normalize_match_keys(group_cfg.get("parameter_name_matches"))
+
             module_class_name = module.__class__.__name__
-            class_names.append(module_class_name)
-            matched = False
-            for group_name, group_cfg in self.lr_groups.items():
-                match_keys = group_cfg.get("matches", [group_name])
-                if any(mk in module_class_name for mk in match_keys):
-                    matched = True
-                    break
+            class_match = any(match_key in module_class_name for match_key in class_match_keys)
+            module_name_match = any(
+                match_key == module_path.split(".")[-1] or match_key in module_path
+                for match_key in module_name_match_keys
+            )
+            parameter_name_match = any(
+                match_key == parameter_name.split(".")[-1] or match_key in parameter_name
+                for match_key in parameter_name_match_keys
+            )
 
-            if matched:
-                for p in module.parameters():
-                    if id(p) not in seen_params and p.requires_grad:
-                        grouped_params[group_name].append(p)
-                        seen_params.add(id(p))
+            return class_match or module_name_match or parameter_name_match
 
-            # Recurse into submodules (including inside ModuleList/Dict)
-            for name, child in module._modules.items():
-                if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
-                    for sub_child in child.values() if isinstance(child, nn.ModuleDict) else child:
-                        visit_module(sub_child)
-                elif isinstance(child, nn.Module):
-                     visit_module(child)
+        def get_group_name(parameter_name: str) -> str:
+            module_path = parameter_name.rsplit(".", 1)[0] if "." in parameter_name else ""
+            candidate_paths = [module_path]
 
-        # Start recursive traversal from self (i.e. the whole model)
-        visit_module(self)
+            while candidate_paths[-1]:
+                parent_path = candidate_paths[-1].rsplit(".", 1)[0] if "." in candidate_paths[-1] else ""
+                candidate_paths.append(parent_path)
 
-        # Assign leftover parameters to default group
-        for p in self.parameters():
-            if id(p) not in seen_params and p.requires_grad:
-                grouped_params["default"].append(p)
-                seen_params.add(id(p))
+            for candidate_path in candidate_paths:
+                module = modules_by_path[candidate_path]
+                for group_name, group_cfg in self.lr_groups.items():
+                    if matches_group(module, candidate_path, parameter_name, group_name, group_cfg):
+                        return group_name
+
+            return "default"
+
+        for parameter_name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            grouped_params[get_group_name(parameter_name)].append(parameter)
 
         param_groups = []
         for group_name, group_cfg in self.lr_groups.items():
+            group_options = {
+                k: v
+                for k, v in group_cfg.items()
+                if k not in {"matches", "module_name_matches", "parameter_name_matches", "lr"}
+            }
+            group_options.setdefault("weight_decay", self.weight_decay)
             param_groups.append({
                 "params": grouped_params[group_name],
                 "lr": group_cfg["lr"],
                 "name": group_name,
-                **{k: v for k, v in group_cfg.items() if k not in {"matches", "lr"}}
+                **group_options,
             })
 
-        optimizer = torch.optim.Adam(param_groups, weight_decay=self.weight_decay)
+        optimizer = torch.optim.Adam(param_groups)
 
         scheduler = CosineWarmupScheduler(
             optimizer=optimizer,

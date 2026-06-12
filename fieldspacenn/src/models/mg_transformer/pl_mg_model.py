@@ -39,6 +39,7 @@ class LightningMGModel(pl.LightningModule):
         self.lr_groups: Mapping[str, Mapping[str, Any]] = lr_groups  
         self.weight_decay: float = weight_decay
         self.loss_aggregation: str = str(lambda_loss_dict.get("aggregation", "mean")).lower()
+        self.normalize_lambdas: bool = bool(lambda_loss_dict.get("normalize_lambdas", False))
         if self.loss_aggregation not in {"mean", "sum"}:
             raise ValueError(f"Unsupported loss aggregation '{self.loss_aggregation}'. Use 'mean' or 'sum'.")
         depth_loss_scaler_cfg = self._extract_depth_loss_scaler_config(lambda_loss_dict)
@@ -49,12 +50,16 @@ class LightningMGModel(pl.LightningModule):
 
         zooms_loss_dict = lambda_loss_dict.get("zooms",{})
         self.loss_zooms: MGMultiLoss = MGMultiLoss(
-            zooms_loss_dict, grid_layers=model.grid_layers
+            zooms_loss_dict,
+            grid_layers=model.grid_layers,
+            normalize_lambdas=self.normalize_lambdas,
         )
 
         comp_loss_dict = lambda_loss_dict.get("composed",{})
         self.loss_composed: MGMultiLoss = MGMultiLoss(
-            comp_loss_dict, grid_layers=model.grid_layers
+            comp_loss_dict,
+            grid_layers=model.grid_layers,
+            normalize_lambdas=self.normalize_lambdas,
         )
         self.lambda_loss_groups = lambda_loss_groups
 
@@ -200,6 +205,22 @@ class LightningMGModel(pl.LightningModule):
             total += int(tensor.shape[1] * tensor.shape[-2])
         return float(total if total > 0 else 1)
 
+    def _group_lambda_normalizer(self, group_loss_inputs: Sequence[Dict[str, Any]]) -> float:
+        if not self.normalize_lambdas or len(group_loss_inputs) == 0:
+            return 1.0
+
+        total_weight = 0.0
+        total_entries = 0
+        for group_input in group_loss_inputs:
+            variable_weight_map = group_input["variable_weight_map"]
+            total_weight += float(variable_weight_map.detach().sum().item()) * float(group_input["lambda_group"])
+            total_entries += int(variable_weight_map.numel())
+
+        if total_entries <= 0 or total_weight <= 0:
+            return 1.0
+
+        return total_weight / float(total_entries)
+
     @staticmethod
     def _merge_loss_dict(dest: Dict[str, float], src: Dict[str, float]) -> Dict[str, float]:
         for key, value in src.items():
@@ -340,17 +361,21 @@ class LightningMGModel(pl.LightningModule):
                     "variable_weight_map": variable_weight_map,
                 }
             )
-        
+
+        group_lambda_normalizer = self._group_lambda_normalizer(group_loss_inputs)
+
+        for group_input in group_loss_inputs:
+            effective_group_lambda = float(group_input["lambda_group"]) / float(group_lambda_normalizer)
             loss, loss_dict = self.loss_zooms(
-                output,
-                target,
-                mask=mask,
+                group_input["output"],
+                group_input["target"],
+                mask=group_input["mask"],
                 sample_configs=sample_configs_target,
                 prefix=f"{prefix}/",
-                emb=emb,
-                variable_weight_map=variable_weight_map,
-                group_index=group_index,
-                group_lambda=float(lambda_group),
+                emb=group_input["emb"],
+                variable_weight_map=group_input["variable_weight_map"],
+                group_index=group_input["group_index"],
+                group_lambda=effective_group_lambda,
                 normalizer=normalizer,
             )
             total_loss += loss
@@ -366,6 +391,7 @@ class LightningMGModel(pl.LightningModule):
             total_loss=total_loss,
             loss_dict_total=loss_dict_total,
             normalizer=normalizer,
+            group_lambda_normalizer=group_lambda_normalizer,
         )
         return total_loss, loss_dict_total, output_groups
 
@@ -377,6 +403,7 @@ class LightningMGModel(pl.LightningModule):
         total_loss: torch.Tensor | float,
         loss_dict_total: Dict[str, float],
         normalizer: float,
+        group_lambda_normalizer: float,
     ) -> tuple[torch.Tensor | float, Dict[str, float]]:
         max_zoom = max((max(group["target"].keys()) for group in group_loss_inputs if group["target"]), default=None)
         if max_zoom is None:
@@ -415,7 +442,7 @@ class LightningMGModel(pl.LightningModule):
                 emb=group_input["emb"],
                 variable_weight_map=group_input["variable_weight_map"],
                 group_index=group_input["group_index"],
-                group_lambda=group_input["lambda_group"],
+                group_lambda=float(group_input["lambda_group"]) / float(group_lambda_normalizer),
                 normalizer=normalizer,
             )
             total_loss += loss

@@ -67,9 +67,11 @@ class MGMultiLoss(nn.Module):
         self,
         lambda_dict: Mapping[str, Any],
         grid_layers: Optional[nn.ModuleDict] = None,
+        normalize_lambdas: bool = False,
     ):
         super().__init__()
         self.grid_layers: Optional[nn.ModuleDict] = grid_layers
+        self.normalize_lambdas: bool = bool(normalize_lambdas)
         self.common_losses: nn.ModuleList = nn.ModuleList()
         self.level_specific_losses: nn.ModuleDict = nn.ModuleDict()
 
@@ -114,6 +116,16 @@ class MGMultiLoss(nn.Module):
             loss_modules.extend(self.level_specific_losses[str(zoom_level)])
         return loss_modules
 
+    def _loss_lambda_normalizer(self, loss_modules: Sequence[nn.Module]) -> float:
+        if not self.normalize_lambdas or len(loss_modules) == 0:
+            return 1.0
+
+        lambda_sum = sum(float(loss_fcn.lambda_val) for loss_fcn in loss_modules)
+        if lambda_sum <= 0:
+            return 1.0
+
+        return lambda_sum / float(len(loss_modules))
+
     def forward(
         self,
         output: Dict[int, torch.Tensor],
@@ -137,6 +149,7 @@ class MGMultiLoss(nn.Module):
             loss_modules = self._loss_modules_for_zoom(zoom_level)
             if not loss_modules:
                 continue
+            loss_lambda_normalizer = self._loss_lambda_normalizer(loss_modules)
 
             if variable_weight_map is None:
                 weight_map = out_zoom.new_ones((out_zoom.shape[1], out_zoom.shape[-2]))
@@ -173,7 +186,7 @@ class MGMultiLoss(nn.Module):
                 weighted_map = (
                     loss_map
                     * weight_map
-                    * float(loss_fcn.lambda_val)
+                    * (float(loss_fcn.lambda_val) / float(loss_lambda_normalizer))
                     * float(group_lambda)
                     / float(normalizer)
                 )

@@ -14,6 +14,7 @@ class HealPixLoader(BaseDataset):
         data_dict: Mapping[str, Any],
         sampling_zooms: Mapping[int, Mapping[str, Any]],
         sampling_zooms_collate: Optional[Mapping[int, Mapping[str, Any]]] = None,
+        sampling_zooms_emb: Optional[Mapping[int, Mapping[str, Any]]] = None,
         sampling_zooms_target: Mapping[int, Mapping[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
@@ -23,6 +24,7 @@ class HealPixLoader(BaseDataset):
         :param data_dict: Dataset configuration including source/target file paths.
         :param sampling_zooms: Sampling configuration keyed by zoom level.
         :param sampling_zooms_collate: Optional collate configuration keyed by zoom level.
+        :param sampling_zooms_emb: Optional embedding-only sampling configuration keyed by zoom level.
         :param kwargs: Additional arguments forwarded to the base dataset initializer.
         :return: None.
         """
@@ -35,6 +37,12 @@ class HealPixLoader(BaseDataset):
         self.sampling_zooms_collate: Optional[Mapping[int, Mapping[str, Any]]] = copy.deepcopy(
             sampling_zooms_collate
         )
+        if sampling_zooms_emb is None:
+            self.sampling_zooms_emb: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms)
+        else:
+            if isinstance(sampling_zooms_emb, (DictConfig, ListConfig)):
+                sampling_zooms_emb = OmegaConf.to_container(sampling_zooms_emb, resolve=True)
+            self.sampling_zooms_emb = copy.deepcopy(sampling_zooms_emb)
 
         if sampling_zooms_target is None:
             self.sampling_zooms_target: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms)

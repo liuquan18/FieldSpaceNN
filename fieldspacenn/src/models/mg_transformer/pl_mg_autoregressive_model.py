@@ -7,6 +7,137 @@ from ...utils.helpers import merge_sampling_dicts
 from ...modules.grids.grid_utils import decode_zooms
 from .pl_mg_model import LightningMGModel
 
+ROLLOUT_TIME_ALIGNED_EMBED_KEYS = (
+    "StaticVariableEmbedder",
+    "TimeEmbedder",
+    "TimeProgressEmbedder",
+    "TimeIndexEmbedder",
+)
+
+
+def _clone_embedding_value(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, dict):
+        cloned_dict = {}
+        for key, item in value.items():
+            normalized_key = (
+                int(key) if isinstance(key, (int, str)) and str(key).lstrip("-").isdigit() else key
+            )
+            cloned_dict[normalized_key] = _clone_embedding_value(item)
+        return cloned_dict
+    return value
+
+
+def clone_embedding_groups(
+    emb_groups: Optional[Sequence[Optional[Dict[str, Any]]]],
+) -> Optional[List[Optional[Dict[str, Any]]]]:
+    if emb_groups is None:
+        return None
+
+    cloned_groups: List[Optional[Dict[str, Any]]] = []
+    for group in emb_groups:
+        if group is None:
+            cloned_groups.append(None)
+            continue
+
+        cloned_groups.append({
+            key: _clone_embedding_value(value)
+            for key, value in group.items()
+        })
+
+    return cloned_groups
+
+
+def get_rollout_embedding_time_slice(
+    zoom: int,
+    sample_configs_emb: Mapping[int, Dict[str, Any]],
+    sample_configs_source: Mapping[int, Dict[str, Any]],
+    step_idx: int,
+    emb_time_len: int,
+) -> slice:
+    if zoom not in sample_configs_source:
+        raise ValueError(f"Missing source sampling config for zoom {zoom}.")
+    if zoom not in sample_configs_emb:
+        raise ValueError(f"Missing embedding sampling config for zoom {zoom}.")
+
+    source_cfg = sample_configs_source[zoom]
+    emb_cfg = sample_configs_emb[zoom]
+    source_n_past = int(source_cfg["n_past_ts"])
+    source_n_future = int(source_cfg["n_future_ts"])
+    emb_n_past = int(emb_cfg["n_past_ts"])
+    emb_n_future = int(emb_cfg["n_future_ts"])
+
+    source_time_len = source_n_past + source_n_future + 1
+    start = emb_n_past - source_n_past + int(step_idx)
+    end = start + source_time_len
+
+    if start < 0 or end > emb_time_len:
+        raise ValueError(
+            f"Autoregressive rollout step {step_idx} at zoom {zoom} requires embedding time range "
+            f"[{start}, {end}) inside a loaded embedding window of length {emb_time_len}. "
+            f"Source window uses n_past_ts={source_n_past}, n_future_ts={source_n_future}; "
+            f"embedding window uses n_past_ts={emb_n_past}, n_future_ts={emb_n_future}."
+        )
+
+    return slice(start, end)
+
+
+def slice_rollout_embedding_zoom_map(
+    embedding_map: Mapping[int, torch.Tensor],
+    sample_configs_emb: Mapping[int, Dict[str, Any]],
+    sample_configs_source: Mapping[int, Dict[str, Any]],
+    step_idx: int,
+) -> Dict[int, torch.Tensor]:
+    aligned_embeddings: Dict[int, torch.Tensor] = {}
+    for zoom_key, tensor in embedding_map.items():
+        zoom = int(zoom_key)
+        if tensor.ndim < 2:
+            aligned_embeddings[zoom] = tensor.clone()
+            continue
+
+        time_slice = get_rollout_embedding_time_slice(
+            zoom=zoom,
+            sample_configs_emb=sample_configs_emb,
+            sample_configs_source=sample_configs_source,
+            step_idx=step_idx,
+            emb_time_len=int(tensor.shape[1]),
+        )
+        aligned_embeddings[zoom] = tensor[:, time_slice].clone()
+
+    return aligned_embeddings
+
+
+def align_embedding_groups_to_rollout_step(
+    base_emb_groups: Optional[Sequence[Optional[Dict[str, Any]]]],
+    sample_configs_emb: Mapping[int, Dict[str, Any]],
+    sample_configs_source: Mapping[int, Dict[str, Any]],
+    step_idx: int,
+) -> Optional[List[Optional[Dict[str, Any]]]]:
+    if base_emb_groups is None:
+        return None
+
+    aligned_groups: List[Optional[Dict[str, Any]]] = []
+    for group in base_emb_groups:
+        if group is None:
+            aligned_groups.append(None)
+            continue
+
+        aligned_group: Dict[str, Any] = {}
+        for key, value in group.items():
+            if key in ROLLOUT_TIME_ALIGNED_EMBED_KEYS and isinstance(value, Mapping):
+                aligned_group[key] = slice_rollout_embedding_zoom_map(
+                    embedding_map=value,
+                    sample_configs_emb=sample_configs_emb,
+                    sample_configs_source=sample_configs_source,
+                    step_idx=step_idx,
+                )
+            else:
+                aligned_group[key] = _clone_embedding_value(value)
+        aligned_groups.append(aligned_group)
+
+    return aligned_groups
+
 
 class LightningMGAutoregressiveModel(LightningMGModel):
     def __init__(
@@ -51,6 +182,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         mask_zooms_groups: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]] = None,
         emb_groups: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
         sample_configs: Mapping[int, Dict[str, Any]] = {},
+        sample_configs_emb: Optional[Mapping[int, Dict[str, Any]]] = None,
         out_zoom: Optional[int] = None,
         mask_zooms: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]] = None,
         emb: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
@@ -67,6 +199,8 @@ class LightningMGAutoregressiveModel(LightningMGModel):
             mask_zooms_groups = mask_zooms
         if emb_groups is None:
             emb_groups = emb
+        if sample_configs_emb is None:
+            sample_configs_emb = sample_configs
 
         if n_steps <= 0:
             if return_all_steps:
@@ -89,25 +223,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
                 else:
                     current_masks.append({int(zoom): tensor.clone() for zoom, tensor in group.items()})
 
-        current_emb_groups = None
-        if emb_groups is not None:
-            current_emb_groups = []
-            for group in emb_groups:
-                if group is None:
-                    current_emb_groups.append(None)
-                    continue
-
-                emb_group = {}
-                for key, value in group.items():
-                    if isinstance(value, dict):
-                        emb_group[key] = {
-                            int(zoom) if isinstance(zoom, (int, str)) and str(zoom).lstrip("-").isdigit() else zoom:
-                            tensor.clone() if torch.is_tensor(tensor) else tensor
-                            for zoom, tensor in value.items()
-                        }
-                    else:
-                        emb_group[key] = value.clone() if torch.is_tensor(value) else value
-                current_emb_groups.append(emb_group)
+        base_emb_groups = clone_embedding_groups(emb_groups)
 
         dataset = self._get_active_dataset()
         mask_ts_mode = getattr(dataset, "mask_ts_mode", "repeat")
@@ -123,7 +239,13 @@ class LightningMGAutoregressiveModel(LightningMGModel):
                 else:
                     forecast_groups.append({zoom: [] for zoom in group})
 
-        for _ in range(n_steps):
+        for step_idx in range(n_steps):
+            current_emb_groups = align_embedding_groups_to_rollout_step(
+                base_emb_groups=base_emb_groups,
+                sample_configs_emb=sample_configs_emb,
+                sample_configs_source=sample_configs,
+                step_idx=step_idx,
+            )
             model_output_groups = self(
                 x_zooms_groups=current_groups,
                 mask_zooms_groups=current_masks,
@@ -176,21 +298,6 @@ class LightningMGAutoregressiveModel(LightningMGModel):
             if output_steps is not None:
                 output_steps.append(next_groups)
             current_groups = next_groups
-
-            if current_emb_groups is not None:
-                shifted_emb_groups = []
-                for group in current_emb_groups:
-                    if group is None:
-                        shifted_emb_groups.append(None)
-                        continue
-
-                    emb_group = dict(group)
-                    if 'TimeEmbedder' in group and isinstance(group['TimeEmbedder'], dict):
-                        emb_group['TimeEmbedder'] = shift_timeembedding(group['TimeEmbedder'])
-                    if 'TimeProgressEmbedder' in group and isinstance(group['TimeProgressEmbedder'], dict):
-                        emb_group['TimeProgressEmbedder'] = shift_time_progress_embedding(group['TimeProgressEmbedder'])
-                    shifted_emb_groups.append(emb_group)
-                current_emb_groups = shifted_emb_groups
         if output_steps is not None:
             return output_steps
 
@@ -212,6 +319,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         target_groups: Sequence[Dict[int, torch.Tensor]],
         sample_configs: Mapping[int, Dict[str, Any]] = {},
         sample_configs_target: Optional[Mapping[int, Dict[str, Any]]] = None,
+        sample_configs_emb: Optional[Mapping[int, Dict[str, Any]]] = None,
         mask_groups: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]] = None,
         emb_groups: Optional[Sequence[Dict[str, Any]]] = None,
         prefix: str = '',
@@ -235,6 +343,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
             mask_zooms_groups=mask_groups,
             emb_groups=emb_groups,
             sample_configs=sample_configs,
+            sample_configs_emb=sample_configs_emb,
             n_steps=self.n_autoregressive_steps,
         )
 
@@ -257,16 +366,19 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         dataset = self.trainer.datamodule.dataset_train
         sample_configs = dataset.sampling_zooms_collate or dataset.sampling_zooms
         sample_configs_target = getattr(dataset, "sampling_zooms_target", sample_configs)
+        sample_configs_emb = getattr(dataset, "sampling_zooms_emb", sample_configs)
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
 
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)
         sample_configs_target = merge_sampling_dicts(sample_configs_target, patch_index_zooms)
+        sample_configs_emb = merge_sampling_dicts(sample_configs_emb, patch_index_zooms)
 
         loss, loss_dict, _ = self.get_losses(
             source_groups,
             target_groups,
             sample_configs,
             sample_configs_target=sample_configs_target,
+            sample_configs_emb=sample_configs_emb,
             mask_groups=mask_groups,
             emb_groups=emb_groups,
             prefix='train',
@@ -284,6 +396,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         dataset = self.trainer.datamodule.dataset_val
         sample_configs = dataset.sampling_zooms_collate or dataset.sampling_zooms
         sample_configs_target = getattr(dataset, "sampling_zooms_target", sample_configs)
+        sample_configs_emb = getattr(dataset, "sampling_zooms_emb", sample_configs)
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
 
         max_zooms = [max(target.keys()) for target in target_groups if target]
@@ -291,12 +404,14 @@ class LightningMGAutoregressiveModel(LightningMGModel):
 
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)
         sample_configs_target = merge_sampling_dicts(sample_configs_target, patch_index_zooms)
+        sample_configs_emb = merge_sampling_dicts(sample_configs_emb, patch_index_zooms)
 
         loss, loss_dict, output_groups = self.get_losses(
             [group.copy() for group in source_groups],
             target_groups,
             sample_configs=sample_configs,
             sample_configs_target=sample_configs_target,
+            sample_configs_emb=sample_configs_emb,
             mask_groups=mask_groups,
             emb_groups=emb_groups,
             prefix='val',
@@ -340,15 +455,18 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         dataset = self.trainer.predict_dataloaders.dataset
         sample_configs = dataset.sampling_zooms_collate or dataset.sampling_zooms
         sample_configs_target = getattr(dataset, "sampling_zooms_target", sample_configs)
+        sample_configs_emb = getattr(dataset, "sampling_zooms_emb", sample_configs)
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
 
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)
         sample_configs_target = merge_sampling_dicts(sample_configs_target, patch_index_zooms)
+        sample_configs_emb = merge_sampling_dicts(sample_configs_emb, patch_index_zooms)
         output = self.forward_autoregressive(
             x_zooms_groups=[group.copy() if group is not None else None for group in source_groups],
             mask_zooms_groups=mask_groups,
             emb_groups=emb_groups,
             sample_configs=sample_configs,
+            sample_configs_emb=sample_configs_emb,
             n_steps=self.n_autoregressive_steps,
             return_all_steps=self.return_all_steps,
         )
@@ -386,24 +504,3 @@ class LightningMGAutoregressiveModel(LightningMGModel):
             "output_combined": output_combined,
             "patch_index_zooms": patch_index_zooms,
         }
-
-
-def shift_timeembedding(emb_time: Dict[int, torch.Tensor]):
-    emb_time = emb_time.copy()
-    for zoom, time_zoom in emb_time.items():
-        if time_zoom.shape[1] < 2:
-            continue
-        emb_time[zoom] = time_zoom + time_zoom.diff(dim=1).mean(dim=1, keepdim=True)
-
-    return emb_time
-
-
-def shift_time_progress_embedding(emb_time: Dict[int, torch.Tensor]):
-    emb_time = emb_time.copy()
-    for zoom, time_zoom in emb_time.items():
-        if time_zoom.shape[1] < 2:
-            continue
-        delta = torch.remainder(time_zoom.diff(dim=1), 1.0).mean(dim=1, keepdim=True)
-        emb_time[zoom] = torch.remainder(time_zoom + delta, 1.0)
-
-    return emb_time

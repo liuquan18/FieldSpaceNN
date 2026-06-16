@@ -33,29 +33,6 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         self.n_autoregressive_steps = int(n_autoregressive_steps)
         self.return_all_steps = return_all_steps
 
-    @staticmethod
-    def _extract_forecast_groups(
-        groups: Sequence[Optional[Dict[int, torch.Tensor]]],
-        n_steps: int,
-    ) -> Sequence[Optional[Dict[int, torch.Tensor]]]:
-        forecast_groups = []
-        for group in groups:
-            if group is None:
-                forecast_groups.append(None)
-                continue
-
-            forecast_group = {}
-            for zoom, tensor in group.items():
-                if tensor.shape[2] < n_steps:
-                    raise ValueError(
-                        f"Cannot extract {n_steps} forecast steps for zoom {zoom}: "
-                        f"tensor only has length {tensor.shape[2]}."
-                    )
-                forecast_group[zoom] = tensor[:, :, -n_steps:]
-            forecast_groups.append(forecast_group)
-
-        return forecast_groups
-
     def _get_active_dataset(self) -> Optional[Any]:
         datamodule = getattr(getattr(self, "trainer", None), "datamodule", None)
         if datamodule is None:
@@ -138,7 +115,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
 
         output_steps = [] if return_all_steps else None
         forecast_groups = None
-        if target_time_shift == 0 and not return_all_steps:
+        if not return_all_steps:
             forecast_groups = []
             for group in current_groups:
                 if group is None:
@@ -216,9 +193,6 @@ class LightningMGAutoregressiveModel(LightningMGModel):
                 current_emb_groups = shifted_emb_groups
         if output_steps is not None:
             return output_steps
-
-        if target_time_shift > 0:
-            return self._extract_forecast_groups(current_groups, n_steps=n_steps)
 
         concatenated_forecast_groups = []
         for group in forecast_groups:

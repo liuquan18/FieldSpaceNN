@@ -187,6 +187,64 @@ def _normalize_variable_group_zooms_config(
 
     return normalized
 
+
+def _normalize_sampling_times_emb_config(
+    sampling_times_emb_cfg: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, int]]:
+    """
+    Normalize the optional shared embedding time-window configuration.
+
+    Supported format:
+    - dict: ``{n_past_ts: 3, n_future_ts: 1}``
+    """
+    if isinstance(sampling_times_emb_cfg, DictConfig):
+        sampling_times_emb_cfg = OmegaConf.to_container(sampling_times_emb_cfg, resolve=True)
+
+    if sampling_times_emb_cfg is None:
+        return None
+
+    if not isinstance(sampling_times_emb_cfg, Mapping):
+        raise ValueError(
+            f"Unsupported `sampling_times_emb` config type: {type(sampling_times_emb_cfg)}. "
+            "Use a mapping with `n_past_ts` and `n_future_ts`."
+        )
+
+    missing_keys = [key for key in ("n_past_ts", "n_future_ts") if key not in sampling_times_emb_cfg]
+    if missing_keys:
+        raise ValueError(
+            "`sampling_times_emb` must define both `n_past_ts` and `n_future_ts`. "
+            f"Missing keys: {missing_keys}."
+        )
+
+    return {
+        "n_past_ts": int(sampling_times_emb_cfg["n_past_ts"]),
+        "n_future_ts": int(sampling_times_emb_cfg["n_future_ts"]),
+    }
+
+
+def _build_sample_configs_emb(
+    sampling_zooms: Mapping[int, Mapping[str, Any]],
+    sampling_times_emb: Optional[Mapping[str, int]],
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Build per-zoom embedding sample configs from source zoom configs plus a shared time window.
+    """
+    sample_configs_emb: Dict[int, Dict[str, Any]] = {
+        int(zoom): copy.deepcopy(config)
+        for zoom, config in sampling_zooms.items()
+    }
+
+    if sampling_times_emb is None:
+        return sample_configs_emb
+
+    n_past_ts = int(sampling_times_emb["n_past_ts"])
+    n_future_ts = int(sampling_times_emb["n_future_ts"])
+    for zoom in sample_configs_emb.keys():
+        sample_configs_emb[zoom]["n_past_ts"] = n_past_ts
+        sample_configs_emb[zoom]["n_future_ts"] = n_future_ts
+
+    return sample_configs_emb
+
 #def create_mask(random_p, drop_mask, ):
 
 class BaseDataset(Dataset):
@@ -251,26 +309,27 @@ class BaseDataset(Dataset):
 
         if not hasattr(self, "sampling_zooms_target") or self.sampling_zooms_target is None:
             self.sampling_zooms_target = copy.deepcopy(self.sampling_zooms)
-        if not hasattr(self, "sampling_zooms_emb") or self.sampling_zooms_emb is None:
-            self.sampling_zooms_emb = copy.deepcopy(self.sampling_zooms)
+        if not hasattr(self, "sampling_times_emb"):
+            self.sampling_times_emb = None
 
         self.sampling_zooms = {int(k): v for k, v in self.sampling_zooms.items()}
         self.sampling_zooms_target = {int(k): v for k, v in self.sampling_zooms_target.items()}
-        self.sampling_zooms_emb = {int(k): v for k, v in self.sampling_zooms_emb.items()}
+        self.sampling_times_emb = _normalize_sampling_times_emb_config(self.sampling_times_emb)
         self.zooms: List[int] = sorted(self.sampling_zooms.keys())
         for zoom in self.zooms:
             if zoom not in self.sampling_zooms_target:
                 self.sampling_zooms_target[zoom] = copy.deepcopy(self.sampling_zooms[zoom])
-            if zoom not in self.sampling_zooms_emb:
-                self.sampling_zooms_emb[zoom] = copy.deepcopy(self.sampling_zooms[zoom])
+        self.sample_configs_emb: Dict[int, Dict[str, Any]] = _build_sample_configs_emb(
+            self.sampling_zooms,
+            self.sampling_times_emb,
+        )
         self.zoom_patch_sample: List[int] = [self.sampling_zooms[zoom]['zoom_patch_sample'] for zoom in self.zooms]
         self.zoom_time_steps_past: List[int] = [self.sampling_zooms[zoom]['n_past_ts'] for zoom in self.zooms]
         self.zoom_time_steps_future: List[int] = [self.sampling_zooms[zoom]['n_future_ts'] for zoom in self.zooms]
         self.zoom_time_steps_past_target: List[int] = [self.sampling_zooms_target[zoom]['n_past_ts'] for zoom in self.zooms]
         self.zoom_time_steps_future_target: List[int] = [self.sampling_zooms_target[zoom]['n_future_ts'] for zoom in self.zooms]
-        self.zoom_time_steps_past_emb: List[int] = [self.sampling_zooms_emb[zoom]['n_past_ts'] for zoom in self.zooms]
-        self.zoom_time_steps_future_emb: List[int] = [self.sampling_zooms_emb[zoom]['n_future_ts'] for zoom in self.zooms]
-        self.sample_configs_emb: Dict[int, Dict[str, Any]] = copy.deepcopy(self.sampling_zooms_emb)
+        self.zoom_time_steps_past_emb: List[int] = [self.sample_configs_emb[zoom]['n_past_ts'] for zoom in self.zooms]
+        self.zoom_time_steps_future_emb: List[int] = [self.sample_configs_emb[zoom]['n_future_ts'] for zoom in self.zooms]
 
         self.norm_dict: Optional[str] = norm_dict
         self.lazy_load: bool = lazy_load
@@ -365,8 +424,8 @@ class BaseDataset(Dataset):
                 n_future_ts_source = self.sampling_zooms[zoom]['n_future_ts']
                 n_past_ts_target = self.sampling_zooms_target[zoom]['n_past_ts']
                 n_future_ts_target = self.sampling_zooms_target[zoom]['n_future_ts']
-                n_past_ts_emb = self.sampling_zooms_emb[zoom]['n_past_ts']
-                n_future_ts_emb = self.sampling_zooms_emb[zoom]['n_future_ts']
+                n_past_ts_emb = self.sample_configs_emb[zoom]['n_past_ts']
+                n_future_ts_emb = self.sample_configs_emb[zoom]['n_future_ts']
 
                 start_bounds.append(max(
                     n_past_ts_source,
@@ -1044,16 +1103,16 @@ class BaseDataset(Dataset):
                     mapping_zoom,
                     zoom)
 
-            start_times_emb = np.array(time_indices) - self.sampling_zooms_emb[zoom]['n_past_ts']
-            end_times_emb = np.array(time_indices) + self.sampling_zooms_emb[zoom]['n_future_ts']
+            start_times_emb = np.array(time_indices) - self.sample_configs_emb[zoom]['n_past_ts']
+            end_times_emb = np.array(time_indices) + self.sample_configs_emb[zoom]['n_future_ts']
             time_indices_emb = np.stack(
                 [np.arange(s, e + 1) for s, e in zip(start_times_emb, end_times_emb)],
                 axis=0
             ).reshape(-1)
 
             if (
-                self.sampling_zooms_emb[zoom]['n_past_ts'] == self.sampling_zooms[zoom]['n_past_ts']
-                and self.sampling_zooms_emb[zoom]['n_future_ts'] == self.sampling_zooms[zoom]['n_future_ts']
+                self.sample_configs_emb[zoom]['n_past_ts'] == self.sampling_zooms[zoom]['n_past_ts']
+                and self.sample_configs_emb[zoom]['n_future_ts'] == self.sampling_zooms[zoom]['n_future_ts']
             ):
                 ds_emb_zoom = ds_source_zoom
             else:
@@ -1231,7 +1290,7 @@ class BaseDataset(Dataset):
 
         self.sample_configs_source = sample_configs_source if 'sample_configs_source' in locals() else copy.deepcopy(self.sampling_zooms)
         self.sample_configs_target = sample_configs_target if 'sample_configs_target' in locals() else copy.deepcopy(self.sampling_zooms_target)
-        self.sample_configs_emb = copy.deepcopy(self.sampling_zooms_emb)
+        self.sample_configs_emb = _build_sample_configs_emb(self.sampling_zooms, self.sampling_times_emb)
         for key, value in patch_index_zooms.items():
             if key in self.sample_configs_emb:
                 self.sample_configs_emb[key]['patch_index'] = value

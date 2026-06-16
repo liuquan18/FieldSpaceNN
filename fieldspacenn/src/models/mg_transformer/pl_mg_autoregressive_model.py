@@ -309,6 +309,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
             concatenated_forecast_groups.append({
                 zoom: torch.concat(outputs, dim=2)
                 for zoom, outputs in group.items()
+                if len(outputs) > 0
             })
 
         return concatenated_forecast_groups
@@ -366,7 +367,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         dataset = self.trainer.datamodule.dataset_train
         sample_configs = dataset.sampling_zooms_collate or dataset.sampling_zooms
         sample_configs_target = getattr(dataset, "sampling_zooms_target", sample_configs)
-        sample_configs_emb = getattr(dataset, "sampling_zooms_emb", sample_configs)
+        sample_configs_emb = getattr(dataset, "sample_configs_emb", sample_configs)
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
 
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)
@@ -396,7 +397,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         dataset = self.trainer.datamodule.dataset_val
         sample_configs = dataset.sampling_zooms_collate or dataset.sampling_zooms
         sample_configs_target = getattr(dataset, "sampling_zooms_target", sample_configs)
-        sample_configs_emb = getattr(dataset, "sampling_zooms_emb", sample_configs)
+        sample_configs_emb = getattr(dataset, "sample_configs_emb", sample_configs)
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
 
         max_zooms = [max(target.keys()) for target in target_groups if target]
@@ -455,7 +456,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         dataset = self.trainer.predict_dataloaders.dataset
         sample_configs = dataset.sampling_zooms_collate or dataset.sampling_zooms
         sample_configs_target = getattr(dataset, "sampling_zooms_target", sample_configs)
-        sample_configs_emb = getattr(dataset, "sampling_zooms_emb", sample_configs)
+        sample_configs_emb = getattr(dataset, "sample_configs_emb", sample_configs)
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
 
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)

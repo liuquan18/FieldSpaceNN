@@ -54,7 +54,9 @@ class CustomImageLogger(Logger):
             ckpt_path = self.cfg.get("ckpt_path_pretrained")
             run_id = self.logger_conf.get("id")
             if not run_id or (ckpt_path is not None):
-                self._internal_logger = WandbLogger(**self.logger_conf, id=None)
+                fresh_logger_conf = dict(self.logger_conf)
+                fresh_logger_conf.pop("id", None)
+                self._internal_logger = WandbLogger(**fresh_logger_conf, id=None)
                 if rank_zero_only.rank == 0:
                     # Save the new run id to the config for other processes
                     OmegaConf.update(self.cfg, f"logger.id", self._internal_logger.experiment.id, merge=True)

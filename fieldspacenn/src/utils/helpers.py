@@ -318,15 +318,19 @@ def merge_sampling_dicts(
     :return: Updated sampling configuration dictionary.
     """
 
-    sample_configs = sample_configs.copy()
+    sample_configs = {
+        key: value.copy()
+        for key, value in sample_configs.items()
+    }
 
     for key, value in patch_index_zooms.items():
         if key in sample_configs.keys():
             sample_configs[key]['patch_index'] = value
 
     # Ensure every zoom has a sampling config by inheriting from the lowest defined zoom.
+    min_zoom = min(sample_configs.keys())
     for z in range(max(sample_configs.keys())):
         if z not in sample_configs.keys():
-            sample_configs[z] = sample_configs[min(sample_configs.keys())]
+            sample_configs[z] = sample_configs[min_zoom].copy()
 
     return sample_configs

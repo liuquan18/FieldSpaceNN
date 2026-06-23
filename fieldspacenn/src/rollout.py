@@ -1,8 +1,10 @@
 import os
 import shutil
+import tempfile
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import healpy as hp
@@ -519,6 +521,26 @@ class HealPixZarrPredictionWriter(BasePredictionWriter):
                 )
 
 
+def build_prediction_trainer(
+    trainer_cfg: DictConfig,
+    run_name: str,
+) -> Trainer:
+    # Use a clean root dir so Lightning does not auto-resume an HPC checkpoint
+    # from the training snapshot directory during prediction-only runs.
+    # Force fp32 here so prediction matches the manual validation/reference path.
+    root_dir = Path(
+        tempfile.mkdtemp(prefix=f"fieldspacenn_{run_name}_", dir="/tmp")
+    )
+    return instantiate(
+        trainer_cfg,
+        default_root_dir=str(root_dir),
+        callbacks=[],
+        logger=False,
+        enable_checkpointing=False,
+        precision="32-true",
+    )
+
+
 @hydra.main(version_base=None, config_path="../configs/", config_name="era5_prediction_rollout")
 def rollout(cfg: DictConfig) -> None:
     test_dataset: BaseDataset = instantiate(cfg.dataloader.dataset, data_dict=cfg.data_split["test"])
@@ -543,7 +565,7 @@ def rollout(cfg: DictConfig) -> None:
         include_initial_input_state=cfg.rollout.include_initial_input_state,
     )
 
-    trainer: Trainer = instantiate(cfg.trainer)
+    trainer = build_prediction_trainer(cfg.trainer, run_name="rollout")
     trainer.callbacks.append(writer)
 
     start_time = time.time()

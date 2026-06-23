@@ -139,6 +139,16 @@ def align_embedding_groups_to_rollout_step(
     return aligned_groups
 
 
+def _unwrap_dataset(dataset: Optional[Any]) -> Optional[Any]:
+    current = dataset
+    while current is not None and hasattr(current, "dataset"):
+        nested = getattr(current, "dataset")
+        if nested is None or nested is current:
+            break
+        current = nested
+    return current
+
+
 class LightningMGAutoregressiveModel(LightningMGModel):
     def __init__(
         self,
@@ -165,12 +175,15 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         self.return_all_steps = return_all_steps
 
     def _get_active_dataset(self) -> Optional[Any]:
-        datamodule = getattr(getattr(self, "trainer", None), "datamodule", None)
+        trainer = getattr(self, "trainer", None)
+        datamodule = getattr(trainer, "datamodule", None)
         if datamodule is None:
-            return None
+            predict_dataloaders = getattr(trainer, "predict_dataloaders", None)
+            predict_dataset = _unwrap_dataset(getattr(predict_dataloaders, "dataset", None))
+            return predict_dataset
 
         for dataset_name in ("dataset_train", "dataset_val", "dataset_predict", "dataset_test"):
-            dataset = getattr(datamodule, dataset_name, None)
+            dataset = _unwrap_dataset(getattr(datamodule, dataset_name, None))
             if dataset is not None:
                 return dataset
 
@@ -453,7 +466,7 @@ class LightningMGAutoregressiveModel(LightningMGModel):
         batch: Tuple[Any, Any, Any, Any, Dict[int, torch.Tensor]],
         batch_idx: int,
     ) -> Dict[str, Any]:
-        dataset = self.trainer.predict_dataloaders.dataset
+        dataset = _unwrap_dataset(self.trainer.predict_dataloaders.dataset)
         sample_configs = dataset.sampling_zooms_collate or dataset.sampling_zooms
         sample_configs_target = getattr(dataset, "sampling_zooms_target", sample_configs)
         sample_configs_emb = getattr(dataset, "sample_configs_emb", sample_configs)

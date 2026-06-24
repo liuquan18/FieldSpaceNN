@@ -156,23 +156,23 @@ class LightningMGModel(pl.LightningModule):
         var_ids_list = [int(var_id) for var_id in var_ids_tensor.tolist()]
 
         var_names = emb_group.get("variable_names_sampled", [])
-        depth_values = emb_group.get("depth_values")
-        if isinstance(depth_values, torch.Tensor):
-            if depth_values.ndim > 1:
-                depth_values_tensor = depth_values[0]
+        lambdas_level = emb_group.get("PressureLevelEmbedder")
+        if isinstance(lambdas_level, torch.Tensor):
+            if lambdas_level.ndim > 1:
+                lambdas_level_tensor = lambdas_level[0]
             else:
-                depth_values_tensor = depth_values
-            depth_values_tensor = depth_values_tensor.to(device=reference.device, dtype=reference.dtype)
+                lambdas_level_tensor = lambdas_level
+            lambdas_level_tensor = lambdas_level_tensor.to(device=reference.device, dtype=reference.dtype)
         else:
-            depth_values_tensor = None
+            lambdas_level_tensor = None
 
-        if depth_values_tensor is not None:
-            if depth_values_tensor.numel() != depth_size:
+        if lambdas_level_tensor is not None and lambdas_level_tensor.dim()>1:
+            if lambdas_level_tensor.numel() != depth_size:
                 raise ValueError(
-                    f"Depth values for group {group_index} have length {depth_values_tensor.numel()}, "
+                    f"Depth values for group {group_index} have length {lambdas_level_tensor.numel()}, "
                     f"but runtime depth size is {depth_size}."
                 )
-            depth_weights = self.depth_loss_scaler(depth_values_tensor).to(dtype=reference.dtype)
+            depth_weights = self.depth_loss_scaler(lambdas_level_tensor).to(dtype=reference.dtype)
         else:
             depth_weights = torch.ones(depth_size, device=reference.device, dtype=reference.dtype)
 

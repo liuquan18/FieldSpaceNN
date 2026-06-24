@@ -1,5 +1,6 @@
 import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+import math
 from omegaconf import ListConfig
 
 import torch
@@ -671,6 +672,97 @@ class GroupDepthEmbedder(BaseEmbedder):
             return torch.zeros(*depth_ids.shape, 1, self.embed_dim, device=depth_ids.device)
 
         return self.embedding_fn[group_id](depth_ids)
+
+
+class PressureLevelEmbedder(BaseEmbedder):
+
+    def __init__(
+        self,
+        name: str,
+        in_channels: Optional[int],
+        embed_dim: int,
+        reference_pressure_hpa: Optional[float] = 1100,
+        top_pressure_hpa: Optional[float] = 50,
+        use_surface_embedding: Optional[bool] = True,
+        **kwargs: Any
+    ) -> None:
+        """
+        Initialize per-group depth embeddings.
+
+        :param name: Embedder name.
+        :param in_channels: Unused legacy argument kept for config compatibility.
+        :param embed_dim: Dimensionality of the embedding output.
+        :param init_value: Optional constant initialization value.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: None.
+        """
+        super().__init__(name, 0 if in_channels is None else in_channels, embed_dim)
+
+        self.keep_dims: List[str] = ["b", "d", "c"]
+        self.in_features: List[Optional[int]] = [None if feat is None else int(feat) for feat in in_channels]
+
+        self.top_pressure_hpa = top_pressure_hpa
+        self.reference_pressure_hpa = reference_pressure_hpa
+
+        self.embedding_fn: nn.ModuleList = nn.ModuleList()
+        self.forward_fcns = []
+
+        self.use_surface_embedding = use_surface_embedding 
+        if any(features == 1 for features in in_channels) and use_surface_embedding:
+            self.use_surface_embedding = True
+            self.surface_embedding = nn.Parameter(torch.empty(1, self.embed_dim))
+            nn.init.normal_(self.surface_embedding) 
+
+        if any(features > 1 for features in in_channels):
+            self.pressure_level_embedder: nn.Module = nn.Sequential(
+            RandomFourierLayer(
+                in_features=1,
+                n_neurons=self.embed_dim,
+                wave_length=1
+            ),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+            
+    def normalize_pressure(
+        self,
+        pressure_hpa: torch.Tensor,
+    ) -> torch.Tensor:
+        pressure_hpa = self.reference_pressure_hpa - pressure_hpa.clamp_min(1e-4)
+
+        log_pressure_range = math.log(self.reference_pressure_hpa / self.top_pressure_hpa)
+        log_reference_pressure = math.log(self.reference_pressure_hpa)
+
+        log_height_coordinate = (
+            log_reference_pressure - torch.log(pressure_hpa)
+        )
+
+        return log_height_coordinate / log_pressure_range
+        
+    def forward(
+        self,
+        emb: Tuple[Union[int, torch.Tensor], torch.Tensor],
+        output_zoom: Optional[int] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        """
+        Embed depth indices for a specific variable group.
+
+        :param emb: Tuple of ``(group_id, depth_ids)`` where ``group_id`` selects the
+            group-specific embedding table and ``depth_ids`` indexes the depth entries.
+        :param output_zoom: Unused.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: Depth embedding tensor of shape ``(d, embed_dim)`` or compatible.
+        """
+        if emb.dim() == 1 and self.use_surface_embedding:
+            return self.surface_embedding.expand(emb.shape[0],-1).view(emb.shape[0],1,-1)
+        
+        else:
+            return self.pressure_level_embedder(
+                self.normalize_pressure(emb).unsqueeze(dim=-1)
+                )
+
 
 
 class StaticVariableFieldReshaper(nn.Module):

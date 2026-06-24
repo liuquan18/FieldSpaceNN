@@ -9,12 +9,6 @@ from ...modules.field_space.field_space_attention import FieldSpaceAttentionModu
 from ...modules.field_space.healpix_convolution import MultiZoomHealpixConvBase, MultiZoomHealpixConvConfig
 from ...modules.grids.grid_layer import GridLayer
 from ...utils.helpers import check_get
-from .residual_blocks import (
-    ResidualApplyBlock,
-    ResidualApplyConfig,
-    ResidualSaveBlock,
-    ResidualSaveConfig,
-)
 
 defaults = {
     "predict_var":False,
@@ -207,17 +201,6 @@ def create_encoder_decoder_block(
         block = ConservativeLayer(in_zooms)
         block.out_features = in_features
 
-    elif isinstance(block_conf, ResidualSaveConfig):
-        block = ResidualSaveBlock(out_zooms=in_zooms, out_features=in_features)
-
-    elif isinstance(block_conf, ResidualApplyConfig):
-        block = ResidualApplyBlock(
-            out_zooms=in_zooms,
-            out_features=in_features,
-            mode=block_conf.mode,
-            clear_after_apply=block_conf.clear_after_apply,
-        )
-    
     elif isinstance(block_conf, FieldSpaceAttentionConfig):
         block = FieldSpaceAttentionModule(
                 grid_layers,
@@ -230,9 +213,6 @@ def create_encoder_decoder_block(
                 kv_zooms = block_conf.kv_zooms,
                 target_zooms = block_conf.target_zooms,
                 use_mask = use_mask,
-                refine_zooms= block_conf.refine_zooms,
-                shift= block_conf.shift,
-                multi_shift= block_conf.multi_shift,
                 att_dim = att_dim,
                 n_groups_variables = n_groups_variables,
                 n_groups_depths = list(n_groups_depths),

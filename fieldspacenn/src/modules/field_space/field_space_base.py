@@ -323,6 +323,20 @@ class EmbLayer(nn.Module):
             )
             self.forward_fcn = self.forward_w_shift_scale
 
+        elif aggregation == 'shift_scale_gamma':
+            ranks = emb_ranks if emb_ranks is not None else ([None] * (len(in_features) + 2))
+            self.embedding_layer = get_layer(
+                [*in_features, self.embedder.get_out_channels, 1],
+                [*out_features_, 2],
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode,
+            )
+            self.forward_fcn = self.forward_w_shift_scale_gamma
+            self.gamma_shift = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+            self.gamma_scale = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+
         elif aggregation == 'shift':
             self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_shift
@@ -437,6 +451,26 @@ class EmbLayer(nn.Module):
         shift = shift.squeeze(dim=-1)
 
         x = x * (scale + 1) + shift
+
+        return x
+
+    def forward_w_shift_scale_gamma(self, x: torch.Tensor, emb: Optional[Dict[str, Any]] = None, sample_configs: Dict[str, Any] = {}) -> torch.Tensor:
+        """
+        Apply scale and shift embedding update.
+
+        :param x: Input tensor of shape ``(b, v, t, n, d, f)``.
+        :param emb: Optional embedding dictionary.
+        :param sample_configs: Sampling configuration dictionary.
+        :return: Updated tensor of shape ``(b, v, t, n, d, f)``.
+        """
+        
+        emb_ = self.get_emb_fcn(emb, sample_configs)
+        scale, shift = self.embedding_layer(emb_, sample_configs=sample_configs, emb=emb).chunk(2, dim=-1)
+
+        scale = scale.squeeze(dim=-1)
+        shift = shift.squeeze(dim=-1)
+
+        x = x * (scale * self.gamma_scale + 1) + shift * self.gamma_shift
 
         return x
 

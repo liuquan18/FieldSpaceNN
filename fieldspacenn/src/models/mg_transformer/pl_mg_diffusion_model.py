@@ -249,8 +249,8 @@ class Lightning_MG_diffusion_transformer(LightningMGModel, LightningProbabilisti
                     emb_p['variables_sampled'] = emb_p_group['variables_sampled'][0:1]
                 if 'variable_names_sampled' in emb_p_group:
                     emb_p['variable_names_sampled'] = emb_p_group['variable_names_sampled']
-                if 'depth_values' in emb_p_group:
-                    emb_p['depth_values'] = emb_p_group['depth_values']
+                if 'PressureLevelEmbedder' in emb_p_group:
+                    emb_p['PressureLevelEmbedder'] = emb_p_group['PressureLevelEmbedder']
                 if 'GroupDepthEmbedder' in emb_p_group:
                     emb_p['GroupDepthEmbedder'] = emb_p_group['GroupDepthEmbedder']
                 if 'MGEmbedder' in emb_p_group:

@@ -9,8 +9,6 @@ import torch.nn as nn
 from ..base import get_layer, MLP_fac
 from ..factorization import broadcast_indexed_tensor, build_indexed_dims
 from .field_space_base import (
-    refine_zoom,
-    coarsen_zoom,
     Tokenizer,
     LinEmbLayer,
     add_time_overlap_from_neighbor_patches,
@@ -58,10 +56,7 @@ class FieldSpaceAttentionConfig:
         seq_overlap_time: bool = False,
         seq_overlap_depth: bool = False,
         with_var_att: bool = False,
-        shift: Optional[bool] = None,
-        multi_shift: bool = False,
         update: str = 'shift',
-        refine_zooms: Dict[int, int] = {},
         separate_mlp_norm: bool = True,
         mlp_residual_from_attention: bool = False,
         use_variable_emb_layer: bool = True,
@@ -110,10 +105,7 @@ class FieldSpaceAttentionConfig:
         :param seq_overlap_time: Overlap along time.
         :param seq_overlap_depth: Overlap along depth.
         :param with_var_att: Whether to include variable attention.
-        :param shift: Whether to apply shift.
-        :param multi_shift: Whether to shift at multiple zooms.
         :param update: Update mode ("shift" or "shift_scale").
-        :param refine_zooms: Mapping of zoom refinements.
         :param separate_mlp_norm: Whether to separate MLP norm.
         :param mlp_residual_from_attention: Whether the MLP residual uses the
             post-attention tensor instead of the original zoom tensor.
@@ -157,10 +149,7 @@ class FieldSpaceAttentionConfig:
         self.seq_overlap_time: bool
         self.seq_overlap_depth: bool
         self.with_var_att: bool
-        self.shift: Optional[bool]
-        self.multi_shift: bool
         self.update: str
-        self.refine_zooms: Dict[int, int]
         self.separate_mlp_norm: bool
         self.mlp_residual_from_attention: bool
         self.use_variable_emb_layer: bool
@@ -248,9 +237,6 @@ class FieldSpaceAttentionModule(nn.Module):
         use_mask: bool = False,
         att_dim: Optional[int] = None,
         n_head_channels: int = 16,
-        refine_zooms: Dict[int, int] = {},
-        shift: bool = False,
-        multi_shift: bool = False,
         dropout: float = 0,
         update: str = 'shift',
         separate_mlp_norm: bool = True,
@@ -310,9 +296,6 @@ class FieldSpaceAttentionModule(nn.Module):
         :param use_mask: Whether to apply attention masks.
         :param att_dim: Attention feature dimension.
         :param n_head_channels: Head channel size.
-        :param refine_zooms: Mapping of zoom refinements.
-        :param shift: Whether to apply shift.
-        :param multi_shift: Whether to shift at multiple zooms.
         :param dropout: Dropout rate.
         :param update: Update mode ("shift" or "shift_scale").
         :param separate_mlp_norm: Whether to separate MLP norm.
@@ -399,19 +382,6 @@ class FieldSpaceAttentionModule(nn.Module):
         if not isinstance(kv_zooms,(List,ListConfig)) and (kv_zooms == -1):
             kv_zooms = in_zooms
 
-        # Apply refinement mapping to all configured zoom lists.
-        for k,zoom in enumerate(q_zooms):
-            if zoom in refine_zooms.keys():
-                q_zooms[k] = refine_zooms[zoom]
-        
-        for k,zoom in enumerate(kv_zooms):
-            if zoom in refine_zooms.keys():
-                kv_zooms[k] = refine_zooms[zoom]
-
-        for k,zoom in enumerate(in_zooms):
-            if zoom in refine_zooms.keys():
-                in_zooms[k] = refine_zooms[zoom]
-
         for k, zoom in enumerate(kv_zooms):
             if zoom not in in_zooms:
                 raise ValueError(f"Zoom level {zoom} at index {k} of kv_zooms not found in in_zooms")
@@ -422,7 +392,10 @@ class FieldSpaceAttentionModule(nn.Module):
         seq_zoom = min((min(q_zooms + kv_zooms)), seq_len_zoom)  
 
         if (min(q_zooms + kv_zooms)) < token_zoom:
-            raise ValueError(f"Zoom level {min(q_zooms + kv_zooms)} need to be refined. please indicate refine_zooms={refine_zooms}")
+            raise ValueError(
+                f"Zoom level {min(q_zooms + kv_zooms)} is smaller than token_zoom={token_zoom}. "
+                "Configure a top-level refine block wrap operation before this attention block."
+            )
 
         self.blocks: nn.ModuleList = nn.ModuleList()
         self.active_groups: List[bool] = active_groups
@@ -496,75 +469,8 @@ class FieldSpaceAttentionModule(nn.Module):
                         )
             self.blocks.append(block)
 
-        self.grid_layers: Dict[str, GridLayer] = grid_layers
-        self.multi_shift: bool = multi_shift
-        self.token_zoom: int = token_zoom
-        self.shift: bool = shift
-        self.direction: str = 'east'
-
-        # Build inverse mapping for coarse operations.
-        self.refine_zooms: Dict[int, int] = refine_zooms
-        self.coarse_zooms: Dict[int, int] = invert_dict(refine_zooms)
-
         self.block: Optional[FieldSpaceAttentionBlock] = block
         self.concat_dim = -2 if with_var_att else 0
-
-
-    def refine_groups(self, x_zooms_groups: List[Dict[int, torch.Tensor]]) -> List[Dict[int, torch.Tensor]]:
-        """
-        Refine all zooms in the provided groups.
-
-        :param x_zooms_groups: List of zoom-to-tensor mappings with tensors shaped like
-            ``(b, v, t, n, d, f)``.
-        :return: Refined zoom groups with tensors shaped like ``(b, v, t, n, d, f)``.
-        """
-        for k, x_zooms in enumerate(x_zooms_groups):
-            for in_zoom, out_zoom in self.refine_zooms.items():
-                # Refine in-place to ensure downstream zooms exist.
-                x_zooms[out_zoom] = refine_zoom(x_zooms[in_zoom], in_zoom, out_zoom)
-            x_zooms_groups[k] = x_zooms
-
-        return x_zooms_groups
-        
-    def coarse_groups(self, x_zooms_groups: List[Dict[int, torch.Tensor]]) -> List[Dict[int, torch.Tensor]]:
-        """
-        Coarsen all zooms in the provided groups.
-
-        :param x_zooms_groups: List of zoom-to-tensor mappings with tensors shaped like
-            ``(b, v, t, n, d, f)``.
-        :return: Coarsened zoom groups with tensors shaped like ``(b, v, t, n, d, f)``.
-        """
-        for k, x_zooms in enumerate(x_zooms_groups):
-            for in_zoom, out_zoom in self.coarse_zooms.items():
-                # Coarsen in-place to create matching zooms for outputs.
-                x_zooms[out_zoom] = coarsen_zoom(x_zooms[in_zoom], in_zoom, out_zoom)
-            x_zooms_groups[k] = x_zooms
-        
-        return x_zooms_groups
-
-    def shift_groups(
-        self,
-        x_zooms_groups: List[Dict[int, torch.Tensor]],
-        sample_configs: Dict[int, Dict[str, Any]] = {},
-        reverse: bool = False
-    ) -> List[Dict[int, torch.Tensor]]:
-        """
-        Apply a directional shift to each zoom group.
-
-        :param x_zooms_groups: List of zoom-to-tensor mappings with tensors shaped like
-            ``(b, v, t, n, d, f)``.
-        :param sample_configs: Sampling configuration per zoom.
-        :param reverse: Whether to apply the reverse shift.
-        :return: Shifted zoom groups with tensors shaped like ``(b, v, t, n, d, f)``.
-        """
-        for k, x_zooms in enumerate(x_zooms_groups):
-            for zoom in self.qkv_zooms:
-                # Use a shared shift grid layer or per-zoom shift based on config.
-                grid_layer = self.grid_layers[str(self.token_zoom + 1)] if not self.multi_shift else self.grid_layers[str(zoom)]
-                x_zooms[zoom] = grid_layer.apply_shift(x_zooms[zoom], self.direction, **sample_configs[zoom], reverse=reverse)[0]
-        x_zooms_groups[k] = x_zooms
-
-        return x_zooms_groups
     
     def forward(
         self,
@@ -584,14 +490,7 @@ class FieldSpaceAttentionModule(nn.Module):
         :param sample_configs: Sampling configuration per zoom.
         :return: Updated zoom groups with tensors shaped like ``(b, v, t, n, d, f)``.
         """
-        
-        # Ensure all zooms required by attention are present.
-        x_zooms_groups = self.refine_groups(x_zooms_groups)
 
-        if self.shift:
-            # Optional pre-attention shift for token mixing.
-            x_zooms_groups = self.shift_groups(x_zooms_groups, sample_configs=sample_configs)
-        
         x_ress, qs, Ks, Vs, masks, shapes, seq_lens = [], [], [], [], [], [], []
         active_group_indices = [k for k, is_active in enumerate(self.active_groups) if is_active]
         for block, k in zip(self.blocks, active_group_indices):
@@ -628,10 +527,6 @@ class FieldSpaceAttentionModule(nn.Module):
                     emb=emb_groups[k],
                     sample_configs=sample_configs,
                 )
-
-        if self.shift:
-            # Undo the pre-attention shift.
-            x_zooms_groups = self.shift_groups(x_zooms_groups, sample_configs=sample_configs, reverse=True)
         
         for k, x_zooms in enumerate(x_zooms_groups):
             x_zooms_out = {}
@@ -1476,16 +1371,3 @@ class FieldSpaceAttentionBlock(nn.Module):
             emb=emb,
             sample_configs=sample_configs,
         )
-
-    
-def invert_dict(d: Dict[int, int]) -> Dict[int, int]:
-    """
-    Invert a dictionary mapping.
-
-    :param d: Mapping from key to value.
-    :return: Inverted mapping from value to key.
-    """
-    inverted_d = {}
-    for key, value in d.items():
-        inverted_d[value] = key
-    return inverted_d

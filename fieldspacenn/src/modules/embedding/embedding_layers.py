@@ -40,7 +40,6 @@ class RandomFourierLayer(nn.Module):
 
         if wave_length_2 is None:
             wave_length_2 = wave_length
-  
         weights = torch.concat(
             (
                 torch.randn(in_features, n_neurons // 4) / wave_length,

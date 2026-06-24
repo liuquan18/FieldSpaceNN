@@ -1239,10 +1239,12 @@ class BaseDataset(Dataset):
                 emb_group['GroupDepthEmbedder'] = (group_id, depth_ids)
                 emb_group['MGEmbedder'] = emb_group['VariableEmbedder']
                 if depth_values_groups[group_idx]:
-                    emb_group['depth_values'] = depth_values_groups[group_idx].get(
+                    emb_group['PressureLevelEmbedder'] = depth_values_groups[group_idx].get(
                         max_zoom,
                         next(iter(depth_values_groups[group_idx].values())),
                     )
+                else:
+                    emb_group['PressureLevelEmbedder'] = torch.empty([])
 
                 if StaticVariableEmbedder is not None:
                     emb_group['StaticVariableEmbedder'] = StaticVariableEmbedder
@@ -1277,6 +1279,7 @@ class BaseDataset(Dataset):
             emb = {'StaticVariableEmbedder': emb_groups[0]['StaticVariableEmbedder'],
                     'TimeEmbedder': emb_groups[0]['TimeEmbedder'],
                     'TimeProgressEmbedder': emb_groups[0]['TimeProgressEmbedder'],
+                    'PressureLevelEmbedder': emb_groups[0]['PressureLevelEmbedder'],
                     'TimeIndexEmbedder': emb_groups[0]['TimeIndexEmbedder'],
                     'VarialeEmbedder': torch.zeros(source_zooms_groups_out_[zoom].shape[-1], dtype=torch.long)}
 

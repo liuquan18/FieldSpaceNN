@@ -14,6 +14,7 @@ defaults = {
     "predict_var":False,
     'n_head_channels': 32,
     'att_dim': 256,
+    'att_dim_mixed': 0,
     "fac_mode": "Tucker",
     "emb_aggregation": "shift_scale",
     'embed_confs': {},
@@ -187,6 +188,7 @@ def create_encoder_decoder_block(
     use_mask = check_get([block_conf, kwargs, defaults], "use_mask")
     n_head_channels = check_get([block_conf,kwargs,defaults], "n_head_channels")
     att_dim = check_get([block_conf,kwargs,defaults], "att_dim")
+    att_dim_mixed = check_get([block_conf,kwargs,defaults], "att_dim_mixed")
     if n_groups_depths is None:
         n_groups_depths = [1] * len(n_groups_variables)
     if shared_indexed_group_variables is None:
@@ -214,6 +216,7 @@ def create_encoder_decoder_block(
                 target_zooms = block_conf.target_zooms,
                 use_mask = use_mask,
                 att_dim = att_dim,
+                att_dim_mixed = att_dim_mixed,
                 n_groups_variables = n_groups_variables,
                 n_groups_depths = list(n_groups_depths),
                 shared_indexed_group_variables = list(shared_indexed_group_variables),

@@ -236,6 +236,7 @@ class FieldSpaceAttentionModule(nn.Module):
         with_var_att: bool = False,
         use_mask: bool = False,
         att_dim: Optional[int] = None,
+        att_dim_mixed: Optional[int] = 0,
         n_head_channels: int = 16,
         dropout: float = 0,
         update: str = 'shift',
@@ -415,6 +416,7 @@ class FieldSpaceAttentionModule(nn.Module):
                         q_zooms,
                         kv_zooms,
                         att_dim,
+                        att_dim_mixed = att_dim_mixed,
                         target_zooms = target_zooms,
                         in_features = in_features,
                         token_len_depth= token_len_depth[k],
@@ -550,6 +552,7 @@ class FieldSpaceAttentionBlock(nn.Module):
         q_zooms: List[int],
         kv_zooms: List[int],
         att_dim: int,
+        att_dim_mixed: int = 0,
         target_zooms: Optional[List[int]] = None,
         in_features: int = 1,
         token_len_depth: int = 1,
@@ -946,7 +949,16 @@ class FieldSpaceAttentionBlock(nn.Module):
         # Linear projections into attention space.
         self.q_projection_layer = get_layer(token_size_in_overlap, out_dim_q, ranks=ranks_qkv, n_variables=n_variables_qkv, indexed_dims=indexed_dims_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv, bias=False)
         self.kv_projection_layer = get_layer(token_size_in_kv_overlap, out_dim_kv, ranks=ranks_qkv, n_variables=n_variables_qkv, indexed_dims=indexed_dims_kv, fac_mode=fac_mode, rank_variables=rank_variables_qkv, bias=True)
-        self.out_layer_att = get_layer(out_dim_q, update_dims, ranks=ranks_qkv, n_variables=n_variables_qkv, indexed_dims=indexed_dims_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv)
+        self.out_layer_att = get_layer([1,1,1, att_dim+att_dim_mixed], update_dims, ranks=ranks_qkv, n_variables=n_variables_qkv, indexed_dims=indexed_dims_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv)
+        
+        self.att_dim_mixed = att_dim_mixed
+        if att_dim_mixed > 0:
+            assert n_variables>1, "n_variables need to be fixed and >1 for att_dim_mixed > 0" 
+            in_size_q = token_size_in_overlap[:-1] + [token_size_in_overlap[-1] * n_variables]
+            in_size_kv = token_size_in_overlap[:-1] + [token_size_in_overlap[-1] * n_variables]
+            self.q_projection_layer_mixed = get_layer(in_size_q, [1, 1 , 1, att_dim_mixed], ranks=ranks_qkv, n_variables=1, indexed_dims=indexed_dims_qkv, fac_mode=fac_mode, rank_variables=rank_variables_qkv)
+            self.kv_projection_layer_mixed = get_layer(in_size_kv, [1, 1 , 1, att_dim_mixed*2], ranks=ranks_qkv, n_variables=1, indexed_dims=indexed_dims_kv, fac_mode=fac_mode, rank_variables=rank_variables_qkv)
+            self.mixed_pattern: str = 'b v T N D t n d f -> b 1 T N D t n d (v f)'
 
         # Learned residual scaling for attention and MLP updates.
         self.use_variable_att_gammas: bool = use_variable_att_gammas
@@ -962,7 +974,7 @@ class FieldSpaceAttentionBlock(nn.Module):
         self.mlp = MLP_fac(
             token_size_in_mlp_overlap,
             update_dims_mlp,
-            hidden_dim=out_dim_q,
+            hidden_dim=[1,1,1,att_dim+att_dim_mixed],
             dropout=dropout,
             ranks=ranks_mlp,
             n_variables=n_variables_mlp,
@@ -1172,9 +1184,20 @@ class FieldSpaceAttentionBlock(nn.Module):
         else:
             kv = q
 
+        if self.att_dim_mixed > 0:
+            q_mixed = rearrange(q, self.mixed_pattern)
+            kv_mixed = rearrange(kv, self.mixed_pattern)
+
+            q_mixed: torch.Tensor = self.q_projection_layer_mixed(q_mixed, emb=emb_tokenized, sample_configs=sample_configs[zoom_field])
+            kv_mixed: torch.Tensor = self.kv_projection_layer_mixed(kv_mixed, emb=emb_tokenized, sample_configs=sample_configs[zoom_field])
+
         # Project to attention feature space.
         q = self.q_projection_layer(q, emb=emb_tokenized, sample_configs=sample_configs[zoom_field])
         kv = self.kv_projection_layer(kv, emb=emb_tokenized, sample_configs=sample_configs[zoom_field])
+
+        if self.att_dim_mixed > 0:
+            q = torch.concat((q, q_mixed.expand(-1, q.shape[1], -1, -1, -1, -1, -1, -1, -1)), dim=-1)
+            kv = torch.concat((kv, kv_mixed.expand(-1, kv.shape[1], -1, -1, -1, -1, -1, -1, -1)), dim=-1)
 
         zoom_field = self.grid_layer_field.zoom
 

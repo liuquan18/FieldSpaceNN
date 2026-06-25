@@ -337,6 +337,34 @@ class EmbLayer(nn.Module):
             self.gamma_shift = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
             self.gamma_scale = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
 
+        elif aggregation == 'shift_scale_mlp':
+            ranks = emb_ranks if emb_ranks is not None else ([None] * (len(in_features) + 2))
+            self.embedding_layer = MLP_fac(
+                [*in_features, self.embedder.get_out_channels, 1],
+                [*out_features_, 2],
+                mult=1,
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode
+            ) 
+            self.forward_fcn = self.forward_w_shift_scale
+        
+        elif aggregation == 'shift_scale_mlp_gamma':
+            ranks = emb_ranks if emb_ranks is not None else ([None] * (len(in_features) + 2))
+            self.embedding_layer = MLP_fac(
+                [*in_features, self.embedder.get_out_channels, 1],
+                [*out_features_, 2],
+                mult=1,
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode
+            ) 
+            self.forward_fcn = self.forward_w_shift_scale_gamma
+            self.gamma_shift = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+            self.gamma_scale = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+
         elif aggregation == 'shift':
             self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_shift

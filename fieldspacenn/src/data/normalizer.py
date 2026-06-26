@@ -264,7 +264,54 @@ class MeanStdNormalizer(DataNormalizer):
         # Rescale data to the original scale by multiplying by std and adding the mean
         std = _match_stat_shape(self.std, data_var)
         return data_var * std**2
-    
+
+class StdNormalizer(DataNormalizer):
+    """
+    Normalizer that standardizes data using mean and standard deviation from precomputed statistics.
+
+    :param stat_dict: Dictionary containing mean and standard deviation for normalization.
+    :param definition_dict: Dictionary containing additional settings for normalization.
+    """
+
+    def __init__(self, stat_dict: Dict[str, Any], definition_dict: Dict[str, Any]):
+        super().__init__()
+
+        # Extract standard deviation from the statistics dictionary
+        self.std: torch.Tensor = _to_stat_tensor(stat_dict["std"])
+
+    def normalize(self, data: torch.Tensor):
+        """
+        Standardize data using mean and standard deviation.
+
+        :param data: Input data tensor of shape ``(b, v, t, n, d, f)``.
+        :return: Standardized data tensor.
+        """
+        # Standardize data by subtracting the mean and dividing by the standard deviation
+        std = _match_stat_shape(self.std, data)
+        return (data) / std
+
+    def denormalize(self, data: torch.Tensor):
+        """
+        Reverse the standardization and return data to its original scale.
+
+        :param data: Standardized data tensor of shape ``(b, v, t, n, d, f)``.
+        :return: Data tensor in the original scale.
+        """
+        # Rescale data to the original scale by multiplying by std and adding the mean
+        std = _match_stat_shape(self.std, data)
+        return data * std
+
+    def denormalize_var(self, data_var: torch.Tensor, data: Optional[torch.Tensor] = None):
+        """
+        Reverse the standardization and return data to its original scale.
+
+        :param data_var: Standardized variance tensor of shape ``(b, v, t, n, d, f)``.
+        :param data: Optional standardized data tensor (unused).
+        :return: Denormalized variance tensor.
+        """
+        # Rescale data to the original scale by multiplying by std and adding the mean
+        std = _match_stat_shape(self.std, data_var)
+        return data_var * std**2
 
 class ScaledLogNormalizer(DataNormalizer):
     """

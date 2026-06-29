@@ -2,6 +2,7 @@ import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import math
 from omegaconf import ListConfig
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -848,7 +849,12 @@ class StaticVariableEmbedder(ZoomBaseEmbedder):
         :param kwargs: Additional keyword arguments (unused).
         :return: Embedded tensor of shape ``(b, t, n, embed_dim)``.
         """
-        zoom = self.zoom
+        zoom = output_zoom if output_zoom is not None and output_zoom in emb else self.zoom
+        if zoom not in emb:
+            target_zoom = self.zoom if output_zoom is None else output_zoom
+            available_zooms = list(emb.keys())
+            zoom = min(available_zooms, key=lambda zoom_key: abs(int(zoom_key) - int(target_zoom)))
+
         emb_zoom = emb[zoom]
 
         if emb_zoom.ndim == 3:
@@ -985,6 +991,30 @@ class EmbedderManager:
             self.shared_embedders: Dict[str, BaseEmbedder] = {}
             self._initialized = True
 
+    @staticmethod
+    def _normalize_cache_value(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        if isinstance(value, Mapping):
+            return tuple(
+                sorted((str(key), EmbedderManager._normalize_cache_value(val)) for key, val in value.items())
+            )
+        if isinstance(value, (list, tuple, ListConfig)):
+            return tuple(EmbedderManager._normalize_cache_value(item) for item in value)
+        if isinstance(value, nn.Module):
+            return ("module", value.__class__.__name__, id(value))
+        return repr(value)
+
+    def _get_shared_cache_key(
+        self,
+        name: str,
+        in_channels: Optional[int],
+        embed_dim: Optional[int],
+        kwargs: Dict[str, Any],
+    ) -> str:
+        normalized_kwargs = self._normalize_cache_value(kwargs)
+        return repr((name, in_channels, embed_dim, normalized_kwargs))
+
     def get_embedder(
         self,
         name: str,
@@ -1008,9 +1038,10 @@ class EmbedderManager:
         # Use getattr to get the class from the current module
         embedder_class = getattr(current_module, name)
         if shared:
-            if name not in self.shared_embedders.keys():
-                self.shared_embedders[name] = embedder_class(name, in_channels, embed_dim, **kwargs)
-            return self.shared_embedders[name]
+            cache_key = self._get_shared_cache_key(name, in_channels, embed_dim, kwargs)
+            if cache_key not in self.shared_embedders.keys():
+                self.shared_embedders[cache_key] = embedder_class(name, in_channels, embed_dim, **kwargs)
+            return self.shared_embedders[cache_key]
         else:
             # Create a new instance each time
             return embedder_class(name, in_channels, embed_dim, **kwargs)

@@ -1251,10 +1251,10 @@ class BaseDataset(Dataset):
 
                     
                 emb_group['TimeEmbedder'] = {
-                    zoom: data_time_zooms_emb[zoom] for zoom in source_zooms.keys()
+                    zoom: data_time_zooms_emb[zoom] for zoom in data_time_zooms_emb.keys()
                 }
                 emb_group['TimeProgressEmbedder'] = {
-                    zoom: time_progress_zooms_emb[zoom] for zoom in source_zooms.keys()
+                    zoom: time_progress_zooms_emb[zoom] for zoom in time_progress_zooms_emb.keys()
                 }
                 emb_group['TimeIndexEmbedder'] = emb_group['TimeProgressEmbedder']
                 emb_groups.append(emb_group)

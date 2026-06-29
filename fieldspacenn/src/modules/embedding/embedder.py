@@ -248,6 +248,7 @@ class TimeProgressEmbedder(ZoomBaseEmbedder):
 
     def _get_patch_longitude_fraction(
         self,
+        zoom: int,
         sample_configs: Optional[Dict[str, Any]],
         device: torch.device,
         dtype: torch.dtype,
@@ -256,9 +257,9 @@ class TimeProgressEmbedder(ZoomBaseEmbedder):
             return None
 
         lon_fraction = self.longitude_fraction.to(device=device, dtype=dtype)
-        if self.grid_layer is not None and sample_configs is not None and self.zoom in sample_configs:
+        if self.grid_layer is not None and sample_configs is not None and zoom in sample_configs:
             idx = self.grid_layer.get_idx_of_patch(
-                **sample_configs[self.zoom],
+                **sample_configs[zoom],
                 return_local=False,
             )
             lon_fraction = lon_fraction[idx]
@@ -288,6 +289,7 @@ class TimeProgressEmbedder(ZoomBaseEmbedder):
             emb_zoom = emb_zoom.unsqueeze(2)
 
         lon_fraction = self._get_patch_longitude_fraction(
+            zoom=zoom_key,
             sample_configs=sample_configs,
             device=emb_zoom.device,
             dtype=emb_zoom.dtype,

@@ -5,7 +5,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
-from ...modules.field_space.field_space_base import coarsen_zoom, refine_zoom
+from ...modules.field_space.field_space_base import (
+    GLOBAL_EMBEDDER_CACHE_KEY,
+    coarsen_zoom,
+    refine_zoom,
+)
 from ...modules.grids.grid_layer import GridLayer
 
 ZoomGroup = Dict[int, torch.Tensor]
@@ -646,7 +650,7 @@ class MergeGroupsBlockWrapOperation(BlockWrapOperation):
         merged_emb = {
             key: copy.deepcopy(value)
             for key, value in emb_groups_indexed[0][1].items()
-            if key not in self._VARIABLE_ID_KEYS and key != "variable_names_sampled"
+            if key not in self._VARIABLE_ID_KEYS and key not in {"variable_names_sampled", GLOBAL_EMBEDDER_CACHE_KEY}
         }
 
         variable_name_pieces: List[str] = []

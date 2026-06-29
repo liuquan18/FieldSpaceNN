@@ -3,7 +3,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
-from ...modules.field_space.field_space_base import ConservativeLayer,ConservativeLayerConfig
+from ...modules.field_space.field_space_base import (
+    GLOBAL_EMBEDDER_CACHE_KEY,
+    ConservativeLayer,
+    ConservativeLayerConfig,
+)
 from ...modules.field_space.field_space_layer import FieldSpaceLayerModule, FieldSpaceLayerConfig
 from ...modules.field_space.field_space_attention import FieldSpaceAttentionModule,FieldSpaceAttentionConfig
 from ...modules.field_space.healpix_convolution import MultiZoomHealpixConvBase, MultiZoomHealpixConvConfig
@@ -70,6 +74,8 @@ def create_missing_zooms(
         existing_zooms_set = {int(zoom) for zoom in existing_zooms}
 
         for emb_key, emb_val in emb_group.items():
+            if emb_key == GLOBAL_EMBEDDER_CACHE_KEY:
+                continue
             if not isinstance(emb_val, Mapping):
                 continue
 
@@ -189,6 +195,7 @@ def create_encoder_decoder_block(
     n_head_channels = check_get([block_conf,kwargs,defaults], "n_head_channels")
     att_dim = check_get([block_conf,kwargs,defaults], "att_dim")
     att_dim_mixed = check_get([block_conf,kwargs,defaults], "att_dim_mixed")
+    global_embedders = kwargs.get("global_embedders")
     if n_groups_depths is None:
         n_groups_depths = [1] * len(n_groups_variables)
     if shared_indexed_group_variables is None:
@@ -248,6 +255,7 @@ def create_encoder_decoder_block(
                 dropout = dropout,
                 n_head_channels = n_head_channels,
                 embed_confs = embed_confs,
+                global_embedders = global_embedders,
                 separate_mlp_norm = block_conf.separate_mlp_norm,
                 mlp_residual_from_attention = block_conf.mlp_residual_from_attention,
                 use_variable_emb_layer = block_conf.use_variable_emb_layer,

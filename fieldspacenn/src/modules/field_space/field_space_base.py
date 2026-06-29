@@ -11,6 +11,7 @@ from ..grids.grid_layer import GridLayer
 from ..grids.grid_utils import insert_matching_time_patch, get_matching_time_patch, decode_zooms
 
 _AXIS_POOL = list("g") + list(string.ascii_lowercase.replace("g","")) + list(string.ascii_uppercase)
+GLOBAL_EMBEDDER_CACHE_KEY = "_global_embedder_cache"
 
 
 def add_depth_overlap_from_neighbor_patches(
@@ -273,7 +274,8 @@ class EmbLayer(nn.Module):
         fac_mode: str = "Tucker",
         spatial_dim_count: int = 1,
         field_tokenizer: Optional[Tokenizer] = None,
-        output_zoom: Optional[int] = None
+        output_zoom: Optional[int] = None,
+        embedder_cache_key: Optional[str] = None,
     ) -> None:
         """
         Initialize an embedding aggregation layer.
@@ -295,6 +297,7 @@ class EmbLayer(nn.Module):
         self.field_tokenizer: Optional[Tokenizer] = field_tokenizer
         self.spatial_dim_count: int = spatial_dim_count
         self.output_zoom: Optional[int] = output_zoom
+        self.embedder_cache_key: Optional[str] = embedder_cache_key
 
         if not isinstance(out_features, list):
             out_features_ = [out_features]
@@ -387,7 +390,16 @@ class EmbLayer(nn.Module):
         :param sample_configs: Sampling configuration dictionary.
         :return: Embedded tensor shaped like ``(b, v, t, n, d, c)``.
         """
+        cache = None if emb is None else emb.get(GLOBAL_EMBEDDER_CACHE_KEY)
+        if self.embedder_cache_key is not None and isinstance(cache, Mapping) and self.embedder_cache_key in cache:
+            return cache[self.embedder_cache_key]
+
         emb_ = self.embedder(emb, sample_configs, output_zoom=self.output_zoom)
+        if self.embedder_cache_key is not None and emb is not None:
+            if not isinstance(cache, dict):
+                cache = {}
+                emb[GLOBAL_EMBEDDER_CACHE_KEY] = cache
+            cache[self.embedder_cache_key] = emb_
         return emb_
     
     def get_emb_and_tokenize(self, emb: Dict[str, Any], sample_configs: Dict[str, Any] = {}) -> torch.Tensor:
@@ -533,7 +545,8 @@ class LinEmbLayer(nn.Module):
         embedder: Optional[Any] = None,
         field_tokenizer: Optional[Tokenizer] = None,
         output_zoom: Optional[int] = None,
-        spatial_dim_count: int = 1
+        spatial_dim_count: int = 1,
+        embedder_cache_key: Optional[str] = None,
     ) -> None:
         """
         Initialize a linear embedding layer with optional conditioning.
@@ -581,7 +594,8 @@ class LinEmbLayer(nn.Module):
                                             fac_mode=fac_mode,
                                             spatial_dim_count=spatial_dim_count,
                                             field_tokenizer = field_tokenizer,
-                                            output_zoom=output_zoom)
+                                            output_zoom=output_zoom,
+                                            embedder_cache_key=embedder_cache_key)
            
             concat = emb_aggregation == 'concat'
 

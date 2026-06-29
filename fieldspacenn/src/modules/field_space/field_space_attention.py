@@ -258,6 +258,7 @@ class FieldSpaceAttentionModule(nn.Module):
         use_indexed_att_gammas: Optional[bool] = None,
         use_indexed_mlp_gammas: Optional[bool] = None,
         embed_confs: Dict[str, Any] = {},
+        global_embedders: Optional[nn.ModuleDict] = None,
         fac_mode: str = "Tucker",
         emb_aggregation: str = "shift_scale",
     ) -> None:
@@ -402,7 +403,13 @@ class FieldSpaceAttentionModule(nn.Module):
         self.active_groups: List[bool] = active_groups
 
         input_zoom_field = embed_confs.get("input_zoom", min(q_zooms))
-        shared_embedder = get_embedder(**embed_confs, grid_layers=grid_layers, zoom=input_zoom_field)
+        zoom_key = str(input_zoom_field)
+        embedder_cache_key = None
+        if global_embedders is not None and zoom_key in global_embedders:
+            shared_embedder = global_embedders[zoom_key]
+            embedder_cache_key = zoom_key
+        else:
+            shared_embedder = get_embedder(**embed_confs, grid_layers=grid_layers, zoom=input_zoom_field)
         block = None
         for k, is_active in enumerate(self.active_groups):
             if not is_active:
@@ -447,6 +454,7 @@ class FieldSpaceAttentionModule(nn.Module):
                         dropout=dropout,
                         embed_confs=embed_confs,
                         embedder=shared_embedder,
+                        embedder_cache_key=embedder_cache_key,
                         n_variables=n_groups_variables[k],
                         fac_mode=fac_mode,
                         emb_aggregation=emb_aggregation,
@@ -577,6 +585,7 @@ class FieldSpaceAttentionBlock(nn.Module):
         n_head_channels: int = 32,
         embed_confs: Dict[str, Any] = {},
         embedder: Optional[nn.Module] = None,
+        embedder_cache_key: Optional[str] = None,
         seq_len_time: int = -1,
         seq_len_depth: int = -1,
         seq_overlap_space: bool = False,
@@ -894,6 +903,7 @@ class FieldSpaceAttentionBlock(nn.Module):
             layer_norm=True,
             emb_aggregation=emb_aggregation,
             emb_ranks=emb_ranks,
+            embedder_cache_key=embedder_cache_key,
         )
         
         # Optional separate normalization for MLP path.
@@ -914,6 +924,7 @@ class FieldSpaceAttentionBlock(nn.Module):
                 layer_norm=layer_norm,
                 emb_aggregation=emb_aggregation,
                 emb_ranks=emb_ranks,
+                embedder_cache_key=embedder_cache_key,
             )
         else:
             self.emb_layer_mlp = None
@@ -936,6 +947,7 @@ class FieldSpaceAttentionBlock(nn.Module):
                 layer_norm=layer_norm,
                 emb_aggregation=emb_aggregation,
                 emb_ranks=emb_ranks,
+                embedder_cache_key=embedder_cache_key,
             )
         else:
             self.emb_layer_kv = None

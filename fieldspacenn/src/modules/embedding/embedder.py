@@ -278,7 +278,11 @@ class TimeProgressEmbedder(ZoomBaseEmbedder):
         sample_configs: Optional[Dict[str, Any]] = None,
         **kwargs: Any
     ) -> torch.Tensor:
-        emb_zoom = emb[output_zoom] if output_zoom is not None and output_zoom in emb else emb[self.zoom]
+        zoom_key = output_zoom if output_zoom is not None and output_zoom in emb else self.zoom
+        if not zoom_key in emb.keys():
+            zoom_key = int((torch.tensor(list(emb.keys()),dtype=torch.int) - output_zoom).abs().argmin())
+            zoom_key = list(emb.keys())[zoom_key]
+        emb_zoom = emb[zoom_key]
 
         if emb_zoom.ndim == 3:
             emb_zoom = emb_zoom.unsqueeze(2)

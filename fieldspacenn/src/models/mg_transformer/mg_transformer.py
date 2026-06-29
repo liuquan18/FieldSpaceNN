@@ -1,9 +1,10 @@
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
-from ...modules.field_space.field_space_base import DiffDecoder
+from ...modules.field_space.field_space_base import DiffDecoder, GLOBAL_EMBEDDER_CACHE_KEY
+from ...modules.embedding.embedder import get_embedder
 from .block_wrap_operations import (
     BlockWrapContext,
     BlockWrapConfig,
@@ -69,6 +70,7 @@ class MG_Transformer(MG_base_model):
         shared_indexed_group_variables: Optional[Sequence[bool]] = None,
         shared_indexed_group_depths: Optional[Sequence[bool]] = None,
         shared_indexed_group_space: Optional[Sequence[bool]] = None,
+        use_global_embedder: bool = False,
         **kwargs: Any,
     ) -> None:
         """
@@ -106,7 +108,15 @@ class MG_Transformer(MG_base_model):
             if shared_indexed_group_space is not None
             else [False] * len(n_groups_variables)
         )
+        self.use_global_embedder: bool = use_global_embedder
         self.block_build_kwargs: Dict[str, Any] = dict(kwargs)
+        self.global_embedders: nn.ModuleDict = (
+            self._build_global_embedders(block_configs, block_wrap_configs)
+            if self.use_global_embedder
+            else nn.ModuleDict()
+        )
+        if self.global_embedders:
+            self.block_build_kwargs["global_embedders"] = self.global_embedders
 
         self.block_stages: nn.ModuleDict = nn.ModuleDict()
         self.block_wrap_operations: nn.ModuleDict = nn.ModuleDict()
@@ -201,6 +211,58 @@ class MG_Transformer(MG_base_model):
 
         self.decoder: DiffDecoder = DiffDecoder()
 
+    def _iter_attention_block_configs(
+        self,
+        block_configs: Optional[Mapping[str, Any]],
+        block_wrap_configs: Optional[Mapping[str, Any]],
+    ) -> Iterable[Any]:
+        if block_configs is not None:
+            yield from block_configs.values()
+
+        if block_wrap_configs is None:
+            return
+
+        for wrap_conf in block_wrap_configs.values():
+            stage_block_configs = getattr(wrap_conf, "block_configs", None)
+            if stage_block_configs:
+                yield from stage_block_configs.values()
+
+    def _resolve_embed_input_zoom(self, block_conf: Any) -> int:
+        embed_confs = getattr(block_conf, "embed_confs", {}) or {}
+        if "input_zoom" in embed_confs:
+            return int(embed_confs["input_zoom"])
+
+        q_zooms = getattr(block_conf, "q_zooms", self.in_zooms)
+        if isinstance(q_zooms, int):
+            return int(min(self.in_zooms)) if q_zooms == -1 else int(q_zooms)
+
+        return int(min(q_zooms))
+
+    def _build_global_embedders(
+        self,
+        block_configs: Optional[Mapping[str, Any]],
+        block_wrap_configs: Optional[Mapping[str, Any]],
+    ) -> nn.ModuleDict:
+        global_embedders = nn.ModuleDict()
+
+        for block_conf in self._iter_attention_block_configs(block_configs, block_wrap_configs):
+            embed_confs = getattr(block_conf, "embed_confs", None)
+            if not embed_confs or not embed_confs.get("embed_names"):
+                continue
+
+            input_zoom = self._resolve_embed_input_zoom(block_conf)
+            zoom_key = str(input_zoom)
+            if zoom_key in global_embedders:
+                continue
+
+            global_embedders[zoom_key] = get_embedder(
+                **embed_confs,
+                grid_layers=self.grid_layers,
+                zoom=input_zoom,
+            )
+
+        return global_embedders
+
     def _build_blocks(
         self,
         *,
@@ -246,6 +308,27 @@ class MG_Transformer(MG_base_model):
 
         return blocks, current_in_zooms, current_in_features
 
+    def _prime_global_embedding_cache(
+        self,
+        emb_groups: Optional[Sequence[Optional[Dict[str, Any]]]],
+        sample_configs: Mapping[int, Any],
+    ) -> None:
+        if emb_groups is None or not self.global_embedders:
+            return
+
+        for emb_group in emb_groups:
+            if emb_group is None:
+                continue
+
+            emb_group[GLOBAL_EMBEDDER_CACHE_KEY] = {}
+            for zoom_key, embedder in self.global_embedders.items():
+                zoom = int(zoom_key)
+                emb_group[GLOBAL_EMBEDDER_CACHE_KEY][zoom_key] = embedder(
+                    emb_group,
+                    sample_configs=sample_configs,
+                    output_zoom=zoom,
+                )
+
     def decode(
         self,
         x_zooms: Dict[int, torch.Tensor],
@@ -288,6 +371,7 @@ class MG_Transformer(MG_base_model):
 
         x_zooms_groups, mask_zooms_groups, emb_groups, sample_configs = create_missing_zooms(
             x_zooms_groups, self.in_zooms, mask_zooms_groups, emb_groups, sample_configs=sample_configs)
+        self._prime_global_embedding_cache(emb_groups, sample_configs)
 
         context = BlockWrapContext(
             mask_groups=mask_zooms_groups,

@@ -846,7 +846,7 @@ class StaticVariableEmbedder(ZoomBaseEmbedder):
         :param kwargs: Additional keyword arguments (unused).
         :return: Embedded tensor of shape ``(b, t, n, embed_dim)``.
         """
-        zoom = output_zoom if output_zoom is not None and output_zoom in emb else self.zoom
+        zoom = self.zoom
         emb_zoom = emb[zoom]
 
         if emb_zoom.ndim == 3:

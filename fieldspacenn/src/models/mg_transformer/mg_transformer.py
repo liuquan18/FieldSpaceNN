@@ -1,3 +1,4 @@
+import copy
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
@@ -244,6 +245,7 @@ class MG_Transformer(MG_base_model):
         block_wrap_configs: Optional[Mapping[str, Any]],
     ) -> nn.ModuleDict:
         global_embedders = nn.ModuleDict()
+        global_embed_confs_by_zoom: Dict[str, Dict[str, Any]] = {}
 
         for block_conf in self._iter_attention_block_configs(block_configs, block_wrap_configs):
             embed_confs = getattr(block_conf, "embed_confs", None)
@@ -252,16 +254,58 @@ class MG_Transformer(MG_base_model):
 
             input_zoom = self._resolve_embed_input_zoom(block_conf)
             zoom_key = str(input_zoom)
-            if zoom_key in global_embedders:
+
+            if zoom_key not in global_embed_confs_by_zoom:
+                merged_embed_confs = copy.deepcopy(embed_confs)
+                merged_embed_confs["embed_names"] = self._normalize_embed_names(embed_confs["embed_names"])
+                merged_embed_confs["embed_mode"] = "sum"
+                global_embed_confs_by_zoom[zoom_key] = merged_embed_confs
                 continue
 
+            merged_embed_confs = global_embed_confs_by_zoom[zoom_key]
+            merged_embed_confs["embed_names"] = self._merge_embed_name_lists(
+                merged_embed_confs["embed_names"],
+                embed_confs["embed_names"],
+            )
+            for embed_name, embed_conf in embed_confs.get("embed_confs", {}).items():
+                if embed_name not in merged_embed_confs["embed_confs"]:
+                    merged_embed_confs["embed_confs"][embed_name] = copy.deepcopy(embed_conf)
+
+        for zoom_key, embed_confs in global_embed_confs_by_zoom.items():
             global_embedders[zoom_key] = get_embedder(
                 **embed_confs,
                 grid_layers=self.grid_layers,
-                zoom=input_zoom,
+                zoom=int(zoom_key),
             )
 
         return global_embedders
+
+    @staticmethod
+    def _normalize_embed_names(embed_names: Sequence[Any]) -> List[str]:
+        if not embed_names:
+            return []
+
+        first_entry = embed_names[0]
+        if isinstance(first_entry, Sequence) and not isinstance(first_entry, str):
+            normalized: List[str] = []
+            for group in embed_names:
+                for embed_name in group:
+                    if embed_name not in normalized:
+                        normalized.append(str(embed_name))
+            return normalized
+
+        return [str(embed_name) for embed_name in embed_names]
+
+    def _merge_embed_name_lists(
+        self,
+        base_embed_names: Sequence[Any],
+        new_embed_names: Sequence[Any],
+    ) -> List[str]:
+        merged = self._normalize_embed_names(base_embed_names)
+        for embed_name in self._normalize_embed_names(new_embed_names):
+            if embed_name not in merged:
+                merged.append(embed_name)
+        return merged
 
     def _build_blocks(
         self,

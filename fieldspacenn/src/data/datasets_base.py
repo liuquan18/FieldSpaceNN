@@ -1281,7 +1281,7 @@ class BaseDataset(Dataset):
                     'TimeProgressEmbedder': emb_groups[0]['TimeProgressEmbedder'],
                     'PressureLevelEmbedder': emb_groups[0]['PressureLevelEmbedder'],
                     'TimeIndexEmbedder': emb_groups[0]['TimeIndexEmbedder'],
-                    'VarialeEmbedder': torch.zeros(source_zooms_groups_out_[zoom].shape[-1], dtype=torch.long)}
+                    'VariableEmbedder': torch.zeros(source_zooms_groups_out_[zoom].shape[-1], dtype=torch.long)}
 
             emb_groups = [emb]
             source_zooms_groups_out = [source_zooms_groups_out_]

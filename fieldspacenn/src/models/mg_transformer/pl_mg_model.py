@@ -697,7 +697,7 @@ class LightningMGModel(pl.LightningModule):
                 **group_options,
             })
 
-        optimizer = torch.optim.Adam(param_groups)
+        optimizer = torch.optim.AdamW(param_groups)
 
         scheduler = CosineWarmupScheduler(
             optimizer=optimizer,

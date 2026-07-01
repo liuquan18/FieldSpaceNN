@@ -582,40 +582,70 @@ class ReencodeZoomsBlockWrapConfig(BlockWrapConfig):
             int(zoom): int(feature)
             for zoom, feature in zip(current_in_zooms, current_in_features)
         }
-        decode_zoom = self._resolve_stage_decode_zoom(current_in_zooms)
-        decode_feature = feature_by_zoom.get(decode_zoom)
-        if decode_feature is None:
+        reencoded_highest_zoom = self._resolve_stage_reencoded_highest_zoom(current_in_zooms)
+        reencode_feature = None if reencoded_highest_zoom is None else feature_by_zoom.get(reencoded_highest_zoom)
+        if reencoded_highest_zoom is not None and reencode_feature is None:
             raise ValueError(
-                "ReencodeZoomsBlockWrapConfig requires the decode zoom to exist in the current stage inputs "
-                f"when computing stage input features, got decode_zoom={decode_zoom} and in_zooms={list(current_in_zooms)}."
+                "ReencodeZoomsBlockWrapConfig requires at least one re-encodable zoom in the current stage inputs "
+                "when computing stage input features, "
+                f"got decode_zoom={self.decode_zoom} and in_zooms={list(current_in_zooms)}."
             )
 
-        return [feature_by_zoom.get(zoom, decode_feature) for zoom in stage_input_zooms]
+        stage_input_features: List[int] = []
+        for zoom in stage_input_zooms:
+            feature = feature_by_zoom.get(zoom)
+            if feature is not None:
+                stage_input_features.append(feature)
+                continue
+            if reencode_feature is None:
+                raise ValueError(
+                    "ReencodeZoomsBlockWrapConfig could not infer stage input features for a re-encoded zoom, "
+                    f"got zoom={zoom}, decode_zoom={self.decode_zoom}, and in_zooms={list(current_in_zooms)}."
+                )
+            stage_input_features.append(reencode_feature)
 
-    def _resolve_stage_decode_zoom(self, current_in_zooms: Sequence[int]) -> int:
-        if self.decode_zoom is not None:
-            return int(self.decode_zoom)
-        if not current_in_zooms:
-            raise ValueError("ReencodeZoomsBlockWrapConfig could not infer decode_zoom from empty in_zooms.")
-        return max(int(zoom) for zoom in current_in_zooms)
+        return stage_input_features
+
+    def _partition_stage_input_zooms(self, current_in_zooms: Sequence[int]) -> Tuple[List[int], List[int]]:
+        input_zooms = sorted(dict.fromkeys(int(zoom) for zoom in current_in_zooms))
+        if self.decode_zoom is None:
+            return input_zooms, []
+        reencoded_zooms = [zoom for zoom in input_zooms if zoom <= int(self.decode_zoom)]
+        passthrough_zooms = [zoom for zoom in input_zooms if zoom > int(self.decode_zoom)]
+        return reencoded_zooms, passthrough_zooms
+
+    def _resolve_stage_reencoded_highest_zoom(self, current_in_zooms: Sequence[int]) -> Optional[int]:
+        reencoded_zooms, _ = self._partition_stage_input_zooms(current_in_zooms)
+        if not reencoded_zooms:
+            return None
+        return max(reencoded_zooms)
 
     def _resolve_stage_output_zooms(self, current_in_zooms: Sequence[int]) -> List[int]:
-        decode_zoom = self._resolve_stage_decode_zoom(current_in_zooms)
-        output_zooms = _normalize_unique_sorted_zooms(self.out_zooms)
-        if not output_zooms:
-            return [decode_zoom]
+        reencoded_zooms, passthrough_zooms = self._partition_stage_input_zooms(current_in_zooms)
+        reencoded_highest_zoom = self._resolve_stage_reencoded_highest_zoom(current_in_zooms)
+        requested_output_zooms = _normalize_unique_sorted_zooms(self.out_zooms)
+        if not requested_output_zooms:
+            default_output_zooms = []
+            if reencoded_highest_zoom is not None:
+                default_output_zooms.append(reencoded_highest_zoom)
+            default_output_zooms.extend(passthrough_zooms)
+            return sorted(dict.fromkeys(default_output_zooms))
 
-        if decode_zoom < max(output_zooms):
+        if reencoded_highest_zoom is None:
+            invalid_output_zooms = [zoom for zoom in requested_output_zooms if zoom not in passthrough_zooms]
+        else:
+            invalid_output_zooms = [
+                zoom for zoom in requested_output_zooms
+                if zoom not in passthrough_zooms and zoom > reencoded_highest_zoom
+            ]
+        if invalid_output_zooms:
             raise ValueError(
-                "ReencodeZoomsBlockWrapConfig requires decode_zoom to be at least the maximum output zoom, "
-                f"got decode_zoom={decode_zoom} and out_zooms={output_zooms}."
+                "ReencodeZoomsBlockWrapConfig requires requested output zooms above the re-encode limit to "
+                "already exist as higher untouched inputs, "
+                f"got decode_zoom={self.decode_zoom}, in_zooms={list(current_in_zooms)}, and out_zooms={requested_output_zooms}."
             )
 
-        if decode_zoom not in output_zooms:
-            output_zooms.append(decode_zoom)
-            output_zooms.sort()
-
-        return output_zooms
+        return sorted(dict.fromkeys(requested_output_zooms + passthrough_zooms))
 
 
 class ReencodeZoomsBlockWrapOperation(BlockWrapOperation):
@@ -645,11 +675,14 @@ class ReencodeZoomsBlockWrapOperation(BlockWrapOperation):
             if isinstance(zoom, int)
         }
 
-        decode_zoom = self._resolve_decode_zoom(x_zooms_groups, int_sample_configs)
-        output_zooms = self._resolve_output_zooms(decode_zoom=decode_zoom)
+        reencoded_highest_zoom = self._resolve_reencoded_highest_zoom(x_zooms_groups, int_sample_configs)
+        output_zooms = self._resolve_output_zooms(
+            x_zooms_groups=x_zooms_groups,
+            reencoded_highest_zoom=reencoded_highest_zoom,
+        )
 
         missing_sample_configs = [
-            zoom for zoom in [decode_zoom, *output_zooms]
+            zoom for zoom in ([reencoded_highest_zoom] if reencoded_highest_zoom is not None else []) + output_zooms
             if zoom not in int_sample_configs
         ]
         if missing_sample_configs:
@@ -667,76 +700,136 @@ class ReencodeZoomsBlockWrapOperation(BlockWrapOperation):
                 reencoded_groups.append({})
                 continue
 
-            decoded_group = decode_zooms(
-                {int(zoom): tensor for zoom, tensor in x_zooms.items()},
-                sample_configs=int_sample_configs,
-                out_zoom=decode_zoom,
+            reencoded_group, passthrough_group = self._partition_group_zooms(x_zooms)
+            group_outputs: ZoomGroup = {
+                int(zoom): tensor
+                for zoom, tensor in passthrough_group.items()
+                if int(zoom) in output_zooms
+            }
+
+            reencoded_output_zooms = (
+                [] if reencoded_highest_zoom is None else [zoom for zoom in output_zooms if zoom <= reencoded_highest_zoom]
             )
-            if decode_zoom not in decoded_group:
-                raise ValueError(
-                    f"ReencodeZoomsBlockWrapOperation failed to decode group {group_idx} to zoom {decode_zoom}."
-                )
-
-            decoded_highest = decoded_group[decode_zoom]
-            encoded_inputs: Dict[int, torch.Tensor] = {}
-            for zoom in output_zooms:
-                if zoom == decode_zoom:
-                    encoded_inputs[zoom] = decoded_highest.clone()
-                    continue
-
-                encoded_inputs[zoom] = to_zoom(
-                    decoded_highest,
-                    in_zoom=decode_zoom,
-                    out_zoom=zoom,
-                )[0]
-
-            reencoded_groups.append(
-                encode_zooms(
-                    encoded_inputs,
+            if reencoded_highest_zoom is not None and reencoded_output_zooms:
+                decoded_group = decode_zooms(
+                    {int(zoom): tensor for zoom, tensor in reencoded_group.items()},
                     sample_configs=int_sample_configs,
-                    patch_index_zooms=patch_index_zooms,
+                    out_zoom=reencoded_highest_zoom,
                 )
-            )
+                if reencoded_highest_zoom not in decoded_group:
+                    raise ValueError(
+                        f"ReencodeZoomsBlockWrapOperation failed to decode group {group_idx} to zoom {reencoded_highest_zoom}."
+                    )
+
+                decoded_highest = decoded_group[reencoded_highest_zoom]
+                encoded_inputs: Dict[int, torch.Tensor] = {}
+                for zoom in reencoded_output_zooms:
+                    if zoom == reencoded_highest_zoom:
+                        encoded_inputs[zoom] = decoded_highest
+                        continue
+
+                    encoded_inputs[zoom] = to_zoom(
+                        decoded_highest,
+                        in_zoom=reencoded_highest_zoom,
+                        out_zoom=zoom,
+                    )[0]
+
+                if encoded_inputs:
+                    group_outputs.update(
+                        encode_zooms(
+                            encoded_inputs,
+                            sample_configs=int_sample_configs,
+                            patch_index_zooms=patch_index_zooms,
+                        )
+                    )
+
+            reencoded_groups.append({zoom: group_outputs[zoom] for zoom in output_zooms if zoom in group_outputs})
 
         return reencoded_groups, None
 
-    def _resolve_decode_zoom(
+    def _partition_available_zooms(
         self,
         x_zooms_groups: Sequence[ZoomGroup],
-        sample_configs: Mapping[int, Dict[str, Any]],
-    ) -> int:
-        if self.decode_zoom is not None:
-            return int(self.decode_zoom)
-
+    ) -> Tuple[List[int], List[int]]:
         available_zooms = sorted({
             int(zoom)
             for group in x_zooms_groups
             for zoom in group.keys()
         })
-        if available_zooms:
-            return max(available_zooms)
+        if self.decode_zoom is None:
+            return available_zooms, []
+        reencoded_zooms = [zoom for zoom in available_zooms if zoom <= int(self.decode_zoom)]
+        passthrough_zooms = [zoom for zoom in available_zooms if zoom > int(self.decode_zoom)]
+        return reencoded_zooms, passthrough_zooms
+
+    def _resolve_reencoded_highest_zoom(
+        self,
+        x_zooms_groups: Sequence[ZoomGroup],
+        sample_configs: Mapping[int, Dict[str, Any]],
+    ) -> Optional[int]:
+        reencoded_zooms, passthrough_zooms = self._partition_available_zooms(x_zooms_groups)
+        if reencoded_zooms:
+            return max(reencoded_zooms)
+        if passthrough_zooms:
+            if self.decode_zoom is not None:
+                return None
+            return max(passthrough_zooms)
 
         if sample_configs:
-            return max(int(zoom) for zoom in sample_configs.keys())
+            sample_zooms = sorted(int(zoom) for zoom in sample_configs.keys())
+            if self.decode_zoom is None:
+                return max(sample_zooms)
+            filtered_sample_zooms = [zoom for zoom in sample_zooms if zoom <= int(self.decode_zoom)]
+            return max(filtered_sample_zooms) if filtered_sample_zooms else None
 
-        raise ValueError("ReencodeZoomsBlockWrapOperation could not infer a decode zoom.")
+        raise ValueError("ReencodeZoomsBlockWrapOperation could not infer a re-encoded zoom.")
 
-    def _resolve_output_zooms(self, *, decode_zoom: int) -> List[int]:
-        output_zooms = _normalize_unique_sorted_zooms(self.out_zooms)
-        if not output_zooms:
-            return [decode_zoom]
+    def _resolve_output_zooms(
+        self,
+        *,
+        x_zooms_groups: Sequence[ZoomGroup],
+        reencoded_highest_zoom: Optional[int],
+    ) -> List[int]:
+        _, passthrough_zooms = self._partition_available_zooms(x_zooms_groups)
+        requested_output_zooms = _normalize_unique_sorted_zooms(self.out_zooms)
+        if not requested_output_zooms:
+            default_output_zooms = []
+            if reencoded_highest_zoom is not None:
+                default_output_zooms.append(reencoded_highest_zoom)
+            default_output_zooms.extend(passthrough_zooms)
+            return sorted(dict.fromkeys(default_output_zooms))
 
-        if decode_zoom < max(output_zooms):
+        if reencoded_highest_zoom is None:
+            invalid_output_zooms = [zoom for zoom in requested_output_zooms if zoom not in passthrough_zooms]
+        else:
+            invalid_output_zooms = [
+                zoom for zoom in requested_output_zooms
+                if zoom not in passthrough_zooms and zoom > reencoded_highest_zoom
+            ]
+        if invalid_output_zooms:
             raise ValueError(
-                "ReencodeZoomsBlockWrapOperation requires decode_zoom to be at least the maximum output zoom, "
-                f"got decode_zoom={decode_zoom} and out_zooms={output_zooms}."
+                "ReencodeZoomsBlockWrapOperation requires requested output zooms above the re-encode limit to "
+                "already exist as higher untouched inputs, "
+                f"got decode_zoom={self.decode_zoom}, input_zooms={sorted({int(zoom) for group in x_zooms_groups for zoom in group.keys()})}, "
+                f"and out_zooms={requested_output_zooms}."
             )
 
-        if decode_zoom not in output_zooms:
-            output_zooms.append(decode_zoom)
-            output_zooms.sort()
+        return sorted(dict.fromkeys(requested_output_zooms + passthrough_zooms))
 
-        return output_zooms
+    def _partition_group_zooms(self, x_zooms: ZoomGroup) -> Tuple[ZoomGroup, ZoomGroup]:
+        if self.decode_zoom is None:
+            return dict(x_zooms), {}
+        reencoded_group = {
+            int(zoom): tensor
+            for zoom, tensor in x_zooms.items()
+            if int(zoom) <= int(self.decode_zoom)
+        }
+        passthrough_group = {
+            int(zoom): tensor
+            for zoom, tensor in x_zooms.items()
+            if int(zoom) > int(self.decode_zoom)
+        }
+        return reencoded_group, passthrough_group
 
 
 class MergeGroupsBlockWrapConfig(BlockWrapConfig):

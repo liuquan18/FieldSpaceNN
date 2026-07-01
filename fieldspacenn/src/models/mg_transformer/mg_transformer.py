@@ -144,6 +144,8 @@ class MG_Transformer(MG_base_model):
 
                 stage_build_kwargs = dict(self.block_build_kwargs)
                 stage_wrap_operations = nn.ModuleDict()
+                stage_in_zooms = list(current_in_zooms)
+                stage_in_features = list(current_in_features)
                 if isinstance(wrap_conf, BlockWrapConfig):
                     stage_build_kwargs.update(
                         wrap_conf.get_block_build_overrides(
@@ -152,6 +154,11 @@ class MG_Transformer(MG_base_model):
                             base_block_kwargs=stage_build_kwargs,
                         )
                     )
+                    stage_in_zooms = wrap_conf.get_stage_input_zooms(current_in_zooms)
+                    stage_in_features = wrap_conf.get_stage_input_features(
+                        current_in_zooms=current_in_zooms,
+                        current_in_features=current_in_features,
+                    )
                 stage_wrap_operations[wrap_key] = create_block_wrap_operation(
                     wrap_conf,
                     grid_layers=self.grid_layers,
@@ -159,8 +166,8 @@ class MG_Transformer(MG_base_model):
 
                 stage_blocks, current_in_zooms, current_in_features = self._build_blocks(
                     block_configs=stage_block_configs,
-                    in_zooms=current_in_zooms,
-                    in_features=current_in_features,
+                    in_zooms=stage_in_zooms,
+                    in_features=stage_in_features,
                     block_build_kwargs=stage_build_kwargs,
                 )
                 self.block_stages[wrap_key] = BlockExecutionStage(

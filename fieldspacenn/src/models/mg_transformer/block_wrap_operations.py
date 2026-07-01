@@ -10,6 +10,7 @@ from ...modules.field_space.field_space_base import (
     coarsen_zoom,
     refine_zoom,
 )
+from ...modules.grids.grid_utils import decode_zooms, encode_zooms, to_zoom
 from ...modules.grids.grid_layer import GridLayer
 
 ZoomGroup = Dict[int, torch.Tensor]
@@ -75,6 +76,18 @@ class BlockWrapConfig:
         del base_block_kwargs
         return {}
 
+    def get_stage_input_zooms(self, current_in_zooms: Sequence[int]) -> List[int]:
+        return [int(zoom) for zoom in current_in_zooms]
+
+    def get_stage_input_features(
+        self,
+        *,
+        current_in_zooms: Sequence[int],
+        current_in_features: Sequence[int],
+    ) -> List[int]:
+        del current_in_zooms
+        return [int(feature) for feature in current_in_features]
+
 
 def create_block_wrap_operation(
     wrap_conf: Any,
@@ -107,6 +120,42 @@ def validate_block_wrap_operation_sequence(operations: Mapping[str, BlockWrapOpe
                 f"`{seen_kinds[kind]}` and `{name}`."
             )
         seen_kinds[kind] = name
+
+
+def _normalize_unique_sorted_zooms(zooms: Optional[Sequence[int]]) -> List[int]:
+    if zooms is None:
+        return []
+    return sorted(dict.fromkeys(int(zoom) for zoom in zooms))
+
+
+def _extract_patch_index_zooms(sample_configs: Mapping[int, Dict[str, Any]]) -> Dict[int, Any]:
+    patch_index_zooms: Dict[int, Any] = {}
+    for zoom, cfg in sample_configs.items():
+        if not isinstance(zoom, int) or not isinstance(cfg, Mapping):
+            continue
+        if "patch_index" in cfg:
+            patch_index_zooms[int(zoom)] = cfg["patch_index"]
+    return patch_index_zooms
+
+
+def _validate_matching_timestep_counts(
+    *,
+    zooms: Sequence[int],
+    sample_configs: Mapping[int, Dict[str, Any]],
+) -> None:
+    if len(zooms) <= 1:
+        return
+
+    timestep_counts = {
+        int(zoom): int(sample_configs[int(zoom)]["n_past_ts"]) + int(sample_configs[int(zoom)]["n_future_ts"]) + 1
+        for zoom in zooms
+    }
+    reference_count = next(iter(timestep_counts.values()))
+    if any(count != reference_count for count in timestep_counts.values()):
+        raise ValueError(
+            "ReencodeZoomsBlockWrapOperation requires matching timestep counts across output zooms, "
+            f"got {timestep_counts}."
+        )
 
 
 def clone_zoom_groups(x_zooms_groups: Sequence[ZoomGroup]) -> ZoomGroups:
@@ -482,6 +531,212 @@ class CoarsenGroupsBlockWrapOperation(BlockWrapOperation):
                 x_zooms[out_zoom] = coarsen_zoom(x_zooms[in_zoom], in_zoom, out_zoom)
             x_zooms_groups[group_idx] = x_zooms
         return x_zooms_groups, None
+
+
+class ReencodeZoomsBlockWrapConfig(BlockWrapConfig):
+    operation_kind = "reencode_zooms"
+
+    def __init__(
+        self,
+        decode_zoom: Optional[int] = None,
+        out_zooms: Optional[Sequence[int]] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.decode_zoom: Optional[int]
+        self.out_zooms: Optional[List[int]]
+
+        inputs = copy.deepcopy(locals())
+        for input_name, value in inputs.items():
+            if input_name == "kwargs":
+                for kw_name, kw_value in value.items():
+                    setattr(self, kw_name, kw_value)
+            elif input_name == "out_zooms":
+                setattr(self, input_name, None if value is None else [int(zoom) for zoom in value])
+            elif input_name == "decode_zoom":
+                setattr(self, input_name, None if value is None else int(value))
+            else:
+                setattr(self, input_name, value)
+
+    def build(
+        self,
+        *,
+        grid_layers: nn.ModuleDict,
+    ) -> BlockWrapOperation:
+        del grid_layers
+        return ReencodeZoomsBlockWrapOperation(
+            decode_zoom=self.decode_zoom,
+            out_zooms=self.out_zooms,
+        )
+
+    def get_stage_input_zooms(self, current_in_zooms: Sequence[int]) -> List[int]:
+        return self._resolve_stage_output_zooms(current_in_zooms)
+
+    def get_stage_input_features(
+        self,
+        *,
+        current_in_zooms: Sequence[int],
+        current_in_features: Sequence[int],
+    ) -> List[int]:
+        stage_input_zooms = self._resolve_stage_output_zooms(current_in_zooms)
+        feature_by_zoom = {
+            int(zoom): int(feature)
+            for zoom, feature in zip(current_in_zooms, current_in_features)
+        }
+        decode_zoom = self._resolve_stage_decode_zoom(current_in_zooms)
+        decode_feature = feature_by_zoom.get(decode_zoom)
+        if decode_feature is None:
+            raise ValueError(
+                "ReencodeZoomsBlockWrapConfig requires the decode zoom to exist in the current stage inputs "
+                f"when computing stage input features, got decode_zoom={decode_zoom} and in_zooms={list(current_in_zooms)}."
+            )
+
+        return [feature_by_zoom.get(zoom, decode_feature) for zoom in stage_input_zooms]
+
+    def _resolve_stage_decode_zoom(self, current_in_zooms: Sequence[int]) -> int:
+        if self.decode_zoom is not None:
+            return int(self.decode_zoom)
+        if not current_in_zooms:
+            raise ValueError("ReencodeZoomsBlockWrapConfig could not infer decode_zoom from empty in_zooms.")
+        return max(int(zoom) for zoom in current_in_zooms)
+
+    def _resolve_stage_output_zooms(self, current_in_zooms: Sequence[int]) -> List[int]:
+        decode_zoom = self._resolve_stage_decode_zoom(current_in_zooms)
+        output_zooms = _normalize_unique_sorted_zooms(self.out_zooms)
+        if not output_zooms:
+            return [decode_zoom]
+
+        if decode_zoom < max(output_zooms):
+            raise ValueError(
+                "ReencodeZoomsBlockWrapConfig requires decode_zoom to be at least the maximum output zoom, "
+                f"got decode_zoom={decode_zoom} and out_zooms={output_zooms}."
+            )
+
+        if decode_zoom not in output_zooms:
+            output_zooms.append(decode_zoom)
+            output_zooms.sort()
+
+        return output_zooms
+
+
+class ReencodeZoomsBlockWrapOperation(BlockWrapOperation):
+    operation_kind = "reencode_zooms"
+
+    def __init__(
+        self,
+        *,
+        decode_zoom: Optional[int] = None,
+        out_zooms: Optional[Sequence[int]] = None,
+    ) -> None:
+        super().__init__()
+        self.decode_zoom = None if decode_zoom is None else int(decode_zoom)
+        self.out_zooms = None if out_zooms is None else [int(zoom) for zoom in out_zooms]
+
+    def pre(
+        self,
+        x_zooms_groups: ZoomGroups,
+        context: BlockWrapContext,
+    ) -> Tuple[ZoomGroups, None]:
+        if not x_zooms_groups:
+            return list(x_zooms_groups), None
+
+        int_sample_configs = {
+            int(zoom): cfg
+            for zoom, cfg in context.sample_configs.items()
+            if isinstance(zoom, int)
+        }
+
+        decode_zoom = self._resolve_decode_zoom(x_zooms_groups, int_sample_configs)
+        output_zooms = self._resolve_output_zooms(decode_zoom=decode_zoom)
+
+        missing_sample_configs = [
+            zoom for zoom in [decode_zoom, *output_zooms]
+            if zoom not in int_sample_configs
+        ]
+        if missing_sample_configs:
+            raise ValueError(
+                "ReencodeZoomsBlockWrapOperation requires sample_configs for all decoded/output zooms, "
+                f"missing {sorted(dict.fromkeys(missing_sample_configs))}."
+            )
+
+        _validate_matching_timestep_counts(zooms=output_zooms, sample_configs=int_sample_configs)
+
+        patch_index_zooms = _extract_patch_index_zooms(int_sample_configs)
+        reencoded_groups: ZoomGroups = []
+        for group_idx, x_zooms in enumerate(x_zooms_groups):
+            if not x_zooms:
+                reencoded_groups.append({})
+                continue
+
+            decoded_group = decode_zooms(
+                {int(zoom): tensor for zoom, tensor in x_zooms.items()},
+                sample_configs=int_sample_configs,
+                out_zoom=decode_zoom,
+            )
+            if decode_zoom not in decoded_group:
+                raise ValueError(
+                    f"ReencodeZoomsBlockWrapOperation failed to decode group {group_idx} to zoom {decode_zoom}."
+                )
+
+            decoded_highest = decoded_group[decode_zoom]
+            encoded_inputs: Dict[int, torch.Tensor] = {}
+            for zoom in output_zooms:
+                if zoom == decode_zoom:
+                    encoded_inputs[zoom] = decoded_highest.clone()
+                    continue
+
+                encoded_inputs[zoom] = to_zoom(
+                    decoded_highest,
+                    in_zoom=decode_zoom,
+                    out_zoom=zoom,
+                )[0]
+
+            reencoded_groups.append(
+                encode_zooms(
+                    encoded_inputs,
+                    sample_configs=int_sample_configs,
+                    patch_index_zooms=patch_index_zooms,
+                )
+            )
+
+        return reencoded_groups, None
+
+    def _resolve_decode_zoom(
+        self,
+        x_zooms_groups: Sequence[ZoomGroup],
+        sample_configs: Mapping[int, Dict[str, Any]],
+    ) -> int:
+        if self.decode_zoom is not None:
+            return int(self.decode_zoom)
+
+        available_zooms = sorted({
+            int(zoom)
+            for group in x_zooms_groups
+            for zoom in group.keys()
+        })
+        if available_zooms:
+            return max(available_zooms)
+
+        if sample_configs:
+            return max(int(zoom) for zoom in sample_configs.keys())
+
+        raise ValueError("ReencodeZoomsBlockWrapOperation could not infer a decode zoom.")
+
+    def _resolve_output_zooms(self, *, decode_zoom: int) -> List[int]:
+        output_zooms = _normalize_unique_sorted_zooms(self.out_zooms)
+        if not output_zooms:
+            return [decode_zoom]
+
+        if decode_zoom < max(output_zooms):
+            raise ValueError(
+                "ReencodeZoomsBlockWrapOperation requires decode_zoom to be at least the maximum output zoom, "
+                f"got decode_zoom={decode_zoom} and out_zooms={output_zooms}."
+            )
+
+        if decode_zoom not in output_zooms:
+            output_zooms.append(decode_zoom)
+            output_zooms.sort()
+
+        return output_zooms
 
 
 class MergeGroupsBlockWrapConfig(BlockWrapConfig):

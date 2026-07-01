@@ -544,14 +544,14 @@ def to_zoom(
 
     scale_factor = 4 ** abs(in_zoom - out_zoom)
     
-    vt = x.shape[:2]
+    prefix = x.shape[:-3]
     dc = x.shape[-2:]
 
     if in_zoom > out_zoom:
         # Downsample by averaging.
-        x = x.view(*vt, -1, scale_factor, *dc)
+        x = x.view(*prefix, -1, scale_factor, *dc)
         if mask is not None:
-            mask = mask.reshape(*vt, -1, scale_factor, *mask.shape[-2:])
+            mask = mask.reshape(*prefix, -1, scale_factor, *mask.shape[-2:])
             weight = mask.sum(dim=-3, keepdim=True)
             x_zoom = (x * mask).sum(dim=-3, keepdim=True) / weight.clamp(min=1e-6)
             x_zoom[weight == 0] = 0

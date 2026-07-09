@@ -314,6 +314,7 @@ class BaseDataset(Dataset):
 
         self.sampling_zooms = {int(k): v for k, v in self.sampling_zooms.items()}
         self.sampling_zooms_target = {int(k): v for k, v in self.sampling_zooms_target.items()}
+        self.target_encode_zooms: List[int] = sorted(self.sampling_zooms_target.keys())
         self.sampling_times_emb = _normalize_sampling_times_emb_config(self.sampling_times_emb)
         self.zooms: List[int] = sorted(self.sampling_zooms.keys())
         for zoom in self.zooms:
@@ -884,12 +885,20 @@ class BaseDataset(Dataset):
         """
         sample_configs_source = copy.deepcopy(self.sampling_zooms)
         sample_configs_target = copy.deepcopy(self.sampling_zooms_target)
+        target_return_zooms = [
+            zoom
+            for zoom in getattr(self, "target_encode_zooms", sample_configs_target.keys())
+            if zoom in sample_configs_target
+        ]
         if not data_source:
             for key, value in patch_index_zooms.items():
                 if key in sample_configs_source:
                     sample_configs_source[key]['patch_index'] = value
                 if key in sample_configs_target:
                     sample_configs_target[key]['patch_index'] = value
+            sample_configs_target = {
+                zoom: sample_configs_target[zoom] for zoom in target_return_zooms
+            }
             return {}, {}, sample_configs_source, sample_configs_target, {}
         if data_target is None:
             # Defer target construction until here to avoid masking it with source dropouts.
@@ -900,7 +909,22 @@ class BaseDataset(Dataset):
                     data_target[zoom] = data_source[zoom].clone()
 
         data_source = encode_zooms(data_source, sample_configs_source, patch_index_zooms)
-        data_target = encode_zooms(data_target, sample_configs_target, patch_index_zooms)
+
+        target_encode_zooms = set(target_return_zooms)
+        if target_encode_zooms == set(sample_configs_target.keys()):
+            data_target = encode_zooms(data_target, sample_configs_target, patch_index_zooms)
+        else:
+            data_target_encode = {
+                zoom: data_target[zoom]
+                for zoom in sorted(data_target.keys())
+                if zoom in target_encode_zooms
+            }
+            sample_configs_target_encode = {
+                zoom: sample_configs_target[zoom]
+                for zoom in sorted(sample_configs_target.keys())
+                if zoom in target_encode_zooms
+            }
+            encode_zooms(data_target_encode, sample_configs_target_encode, patch_index_zooms)
 
         available_zooms = sorted(data_source.keys())
 
@@ -948,6 +972,16 @@ class BaseDataset(Dataset):
                 sample_configs_source[key]['patch_index'] = value
             if key in sample_configs_target:
                 sample_configs_target[key]['patch_index'] = value
+
+        data_target = {
+            zoom: data_target[zoom]
+            for zoom in target_return_zooms
+            if zoom in data_target
+        }
+        sample_configs_target = {
+            zoom: sample_configs_target[zoom]
+            for zoom in target_return_zooms
+        }
         
         
         # Optionally mask the last timesteps and repeat or zero them out.
@@ -974,8 +1008,9 @@ class BaseDataset(Dataset):
 
         if self.output_max_zoom_only:
             max_zoom = max(data_source.keys())
+            max_target_zoom = max(data_target.keys()) if data_target else max_zoom
             data_source = decode_zooms(data_source, sample_configs_source, max_zoom)
-            data_target = decode_zooms(data_target, sample_configs_target, max_zoom)
+            data_target = decode_zooms(data_target, sample_configs_target, max_target_zoom)
             mask_mapping_zooms = {max_zoom: mask_mapping_zooms[max_zoom]}
 
         return data_source, data_target, sample_configs_source, sample_configs_target, mask_mapping_zooms
@@ -1264,24 +1299,34 @@ class BaseDataset(Dataset):
             mask_zooms_groups_ = {}
 
         if self.variables_as_features and source_zooms_groups_out:
-            combined_zooms = sorted(
+            source_combined_zooms = sorted(
                 set().union(*(group.keys() for group in source_zooms_groups_out if group))
             )
-            for zoom in combined_zooms:
+            target_combined_zooms = sorted(
+                set().union(*(group.keys() for group in target_zooms_groups_out if group))
+            )
+            mask_combined_zooms = sorted(
+                set().union(*(group.keys() for group in mask_zooms_groups if group))
+            )
+            for zoom in source_combined_zooms:
                 source_groups_zoom = [group[zoom] for group in source_zooms_groups_out if zoom in group]
-                target_groups_zoom = [group[zoom] for group in target_zooms_groups_out if zoom in group]
-                mask_groups_zoom = [group[zoom] for group in mask_zooms_groups if zoom in group]
-
                 source_zooms_groups_out_[zoom] = torch.concat(source_groups_zoom, dim=-1)
+
+            for zoom in target_combined_zooms:
+                target_groups_zoom = [group[zoom] for group in target_zooms_groups_out if zoom in group]
                 target_zooms_groups_out_[zoom] = torch.concat(target_groups_zoom, dim=-1)
+
+            for zoom in mask_combined_zooms:
+                mask_groups_zoom = [group[zoom] for group in mask_zooms_groups if zoom in group]
                 mask_zooms_groups_[zoom] = torch.concat(mask_groups_zoom, dim=-1)
 
+            reference_zoom = max(source_zooms_groups_out_.keys())
             emb = {'StaticVariableEmbedder': emb_groups[0]['StaticVariableEmbedder'],
                     'TimeEmbedder': emb_groups[0]['TimeEmbedder'],
                     'TimeProgressEmbedder': emb_groups[0]['TimeProgressEmbedder'],
                     'PressureLevelEmbedder': emb_groups[0]['PressureLevelEmbedder'],
                     'TimeIndexEmbedder': emb_groups[0]['TimeIndexEmbedder'],
-                    'VariableEmbedder': torch.zeros(source_zooms_groups_out_[zoom].shape[-1], dtype=torch.long)}
+                    'VariableEmbedder': torch.zeros(source_zooms_groups_out_[reference_zoom].shape[-1], dtype=torch.long)}
 
             emb_groups = [emb]
             source_zooms_groups_out = [source_zooms_groups_out_]

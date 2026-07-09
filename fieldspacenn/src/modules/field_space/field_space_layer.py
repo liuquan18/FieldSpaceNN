@@ -38,6 +38,7 @@ class FieldSpaceLayerConfig:
         out_token_len_depth: int = 1,
         n_groups_variables: List[int] = [1],
         residual: bool = False,
+        residual_gamma: bool = False,
         mult: int = 2,
         hidden_dim: int = None,
         type: str = 'linear',
@@ -62,6 +63,8 @@ class FieldSpaceLayerConfig:
         :param out_token_len_depth: Output token length along depth.
         :param n_groups_variables: Number of variable groups.
         :param residual: Whether to add a residual connection around the layer.
+        :param residual_gamma: Whether to scale the learned layer-output branch with
+            a gamma initialized near zero before adding the residual skip.
         :param mult: MLP multiplier when using non-linear type.
         :param hidden_dim: Optional explicit hidden dimension for MLP.
         :param type: Layer type ("linear" or "mlp").
@@ -84,6 +87,7 @@ class FieldSpaceLayerConfig:
         self.out_token_len_depth: int
         self.n_groups_variables: List[int]
         self.residual: bool
+        self.residual_gamma: bool
         self.mult: int
         self.hidden_dim: int
         self.type: str
@@ -125,6 +129,7 @@ class FieldSpaceLayerModule(nn.Module):
         in_features = kwargs.get('in_features', 1)
         target_features = kwargs.get('target_features', 1)
         residual = check_value(kwargs.get('residual', False), n_groups)
+        residual_gamma = check_value(kwargs.get('residual_gamma', False), n_groups)
         fac_mode = kwargs.get("fac_mode", "Tucker")
 
         for i in range(n_groups):
@@ -134,6 +139,7 @@ class FieldSpaceLayerModule(nn.Module):
             block_kwargs['in_features'] = in_features
             block_kwargs['target_features'] = target_features
             block_kwargs['residual'] = residual[i]
+            block_kwargs['residual_gamma'] = residual_gamma[i]
 
             block = FieldSpaceLayerBlock(
                 grid_layers=grid_layers,
@@ -204,6 +210,7 @@ class FieldSpaceLayerBlock(nn.Module):
         mult: int = 2,
         hidden_dim: int = None,
         residual: bool = False,
+        residual_gamma: bool = False,
         n_variables: int = 1,
         fac_mode: str = "Tucker",
     ) -> None:
@@ -232,6 +239,8 @@ class FieldSpaceLayerBlock(nn.Module):
         :param mult: MLP multiplier when using non-linear type.
         :param hidden_dim: Optional explicit hidden dimension for MLP.
         :param residual: Whether to add a residual connection around the layer.
+        :param residual_gamma: Whether to scale the learned layer-output branch with
+            a gamma initialized near zero before adding the residual skip.
         :param layer_confs: Layer configuration dictionary.
         :return: None.
         """
@@ -245,6 +254,7 @@ class FieldSpaceLayerBlock(nn.Module):
         self.token_overlap_time: bool = token_overlap_time
         self.token_overlap_depth: bool = token_overlap_depth
         self.residual: bool = residual
+        self.residual_gamma: bool = residual_gamma
 
         self.out_zooms: Optional[List[int]] = out_zooms
         self.in_zooms: List[int] = in_zooms
@@ -317,6 +327,7 @@ class FieldSpaceLayerBlock(nn.Module):
 
         # Residual is taken from input `x_zooms` at matching output zoom keys.
         self.skip_projection_by_zoom: nn.ModuleDict = nn.ModuleDict()
+        self.output_gamma_by_zoom: nn.ParameterDict = nn.ParameterDict()
         self.residual_source_zoom_by_target: Dict[int, int] = {}
         self.residual_zoom_mode_by_target: Dict[int, str] = {}
         self.residual_zoom_factor_by_target: Dict[int, int] = {}
@@ -357,6 +368,12 @@ class FieldSpaceLayerBlock(nn.Module):
                         in_features_zoom,
                         factor * out_features_zoom,
                         bias=False,
+                    )
+
+                if self.residual_gamma:
+                    self.output_gamma_by_zoom[str(target_zoom)] = nn.Parameter(
+                        torch.ones(out_features_zoom) * 1e-12,
+                        requires_grad=True,
                     )
 
         self.pattern_tokens_reverse: str = 'b v T N D t (n f) d 1 -> b v (T t) (N n) (D d) f'
@@ -431,6 +448,22 @@ class FieldSpaceLayerBlock(nn.Module):
 
         raise ValueError(f"Unsupported residual zoom mode `{mode}` for zoom {target_zoom}.")
 
+    def _apply_output_gamma(
+        self,
+        x_out: torch.Tensor,
+        target_zoom: int,
+    ) -> torch.Tensor:
+        """
+        Apply per-feature learned scaling to the layer-output branch.
+
+        :param x_out: Layer-output tensor of shape ``(b, v, t, n, d, f)``.
+        :param target_zoom: Target zoom key used to select gamma weights.
+        :return: Layer-output tensor scaled by the learned gamma.
+        """
+        if not self.residual_gamma:
+            return x_out
+        return x_out * self.output_gamma_by_zoom[str(target_zoom)]
+
     def forward(
         self,
         x_zooms: Dict[int, torch.Tensor],
@@ -467,6 +500,7 @@ class FieldSpaceLayerBlock(nn.Module):
         
         for k, (zoom, n) in enumerate(self.n_out_features_zooms.items()):
             x_zoom_out = rearrange(x[k], self.pattern_tokens_reverse, f=self.target_features_dict[zoom], v=nv)
+            x_zoom_out = self._apply_output_gamma(x_zoom_out, zoom)
             if zoom in residual_inputs:
                 residual = self._apply_residual_projection(residual_inputs[zoom], zoom)
                 x_zoom_out = x_zoom_out + residual

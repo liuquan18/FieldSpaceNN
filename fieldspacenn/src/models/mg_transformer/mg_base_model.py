@@ -320,6 +320,7 @@ def create_encoder_decoder_block(
                 token_overlap_time = block_conf.token_overlap_time,
                 token_overlap_depth = block_conf.token_overlap_depth,
                 residual = check_get([block_conf, {"residual": False}], "residual"),
+                residual_gamma = check_get([block_conf, {"residual_gamma": False}], "residual_gamma"),
                 type= block_conf.type,
                 fac_mode=fac_mode)
     return block

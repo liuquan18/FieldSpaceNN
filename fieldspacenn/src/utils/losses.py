@@ -86,6 +86,8 @@ class MGMultiLoss(nn.Module):
                     self.level_specific_losses[zoom_level] = nn.ModuleList()
                 for loss_name, lambda_value in level_config.items():
                     self._add_loss(loss_name, lambda_value, self.level_specific_losses[zoom_level], zoom_level)
+            elif key != "common" and key in globals():
+                self._add_loss(str(key), level_config, self.common_losses)
 
     def _add_loss(
         self,

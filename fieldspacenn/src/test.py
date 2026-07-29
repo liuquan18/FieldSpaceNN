@@ -58,7 +58,7 @@ def _group_and_variable_meta(data: Any) -> Tuple[List[List[str]], List[str]]:
         )
 
     for group_name, variables in variable_groups.items():
-        if group_name == "embedding":
+        if group_name in ("embedding", "embedding_1D"):
             continue
 
         if isinstance(variables, str):
@@ -277,8 +277,6 @@ def test(cfg: DictConfig) -> None:
         output[:, var_idx] = test_dataset.var_normalizers[normalizer_zoom][var_name].denormalize(output[:, var_idx])
 
     output_dict = dict(zip(output_keys, output.split(1, dim=1)))
-    print(output_dict["tas"].shape)
-    print(output_dict["uas"][0])
     torch.save(output_dict, cfg.output_path)
 
 

@@ -215,7 +215,7 @@ def create_encoder_decoder_block(
                 grid_layers,
                 in_zooms,
                 out_zooms,
-                in_features = in_features[0],
+                in_features = in_features,
                 token_zoom = block_conf.token_zoom,
                 groups = block_conf.groups,
                 q_zooms  = block_conf.q_zooms,
@@ -273,6 +273,7 @@ def create_encoder_decoder_block(
                 use_variable_mlp_gammas = block_conf.use_variable_mlp_gammas,
                 use_indexed_att_gammas = block_conf.use_indexed_att_gammas,
                 use_indexed_mlp_gammas = block_conf.use_indexed_mlp_gammas,
+                block_type = block_conf.block_type,
                 fac_mode=fac_mode,
                 emb_aggregation=emb_aggregation)
         block.out_features = in_features

@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 from einops import rearrange
 import copy
 from omegaconf import ListConfig
@@ -22,7 +22,89 @@ from ..embedding.embedder import get_embedder
 
 from ..grids.grid_utils import insert_matching_time_patch
 
-from ...utils.helpers import check_value
+def _is_sequence_value(value: Any) -> bool:
+    return isinstance(value, (list, tuple, ListConfig))
+
+
+def _normalize_axis_values(
+    value: Any,
+    keys: Sequence[int],
+    name: str,
+) -> Dict[int, Any]:
+    """Broadcast a scalar or align an exact-length value sequence to integer keys."""
+    keys = [int(key) for key in keys]
+    if isinstance(value, Mapping):
+        normalized = {int(key): item for key, item in value.items()}
+        missing = [key for key in keys if key not in normalized]
+        extra = [key for key in normalized if key not in keys]
+        if missing or extra:
+            raise ValueError(f"{name} keys must match {keys}; missing={missing}, extra={extra}")
+        return {key: normalized[key] for key in keys}
+    if _is_sequence_value(value):
+        values = list(value)
+        if len(values) != len(keys):
+            raise ValueError(f"{name} must have length {len(keys)}, got {len(values)}")
+        return dict(zip(keys, values))
+    return {key: value for key in keys}
+
+
+def _normalize_group_values(value: Any, n_groups: int, name: str) -> List[Any]:
+    """Broadcast a scalar or validate an exact-length group sequence."""
+    if isinstance(value, Mapping):
+        normalized = {int(key): item for key, item in value.items()}
+        expected = list(range(n_groups))
+        if sorted(normalized) != expected:
+            raise ValueError(f"{name} group keys must be {expected}, got {sorted(normalized)}")
+        return [normalized[index] for index in expected]
+    if _is_sequence_value(value):
+        values = list(value)
+        if len(values) != n_groups:
+            raise ValueError(f"{name} must have length {n_groups}, got {len(values)}")
+        return values
+    return [value] * n_groups
+
+
+def _collapse_shared_value(value: Any, name: str) -> Any:
+    """Collapse a legacy list to one shared value, rejecting conflicting entries."""
+    if not _is_sequence_value(value):
+        return value
+    values = list(value)
+    if not values:
+        raise ValueError(f"{name} cannot be empty")
+    first = values[0]
+    if any(item != first for item in values[1:]):
+        raise ValueError(
+            f"{name} must be constant across legacy groups; got {values}. "
+            "Use block_type='ext' for per-zoom values."
+        )
+    return first
+
+
+def _normalize_ext_rank_depth(
+    value: Any,
+    n_groups: int,
+    zooms: Sequence[int],
+) -> List[Dict[int, Any]]:
+    """Normalize Ext rank_depth as scalar or group-by-zoom values."""
+    if not _is_sequence_value(value) and not isinstance(value, Mapping):
+        per_zoom = _normalize_axis_values(value, zooms, "rank_depth")
+        return [dict(per_zoom) for _ in range(n_groups)]
+
+    if isinstance(value, Mapping):
+        group_values = _normalize_group_values(value, n_groups, "rank_depth")
+    else:
+        values = list(value)
+        is_nested = any(_is_sequence_value(item) or isinstance(item, Mapping) for item in values)
+        if not is_nested:
+            raise ValueError(
+                "Ext rank_depth must be a scalar or nested group-by-zoom values"
+            )
+        group_values = _normalize_group_values(values, n_groups, "rank_depth")
+
+    return [
+        _normalize_axis_values(group_value, zooms, f"rank_depth[{group_index}]")
+        for group_index, group_value in enumerate(group_values)
+    ]
 
 
 class FieldSpaceAttentionConfig:
@@ -74,6 +156,7 @@ class FieldSpaceAttentionConfig:
         use_variable_mlp_gammas: bool = False,
         use_indexed_att_gammas: Optional[bool] = None,
         use_indexed_mlp_gammas: Optional[bool] = None,
+        block_type: Literal["legacy", "ext"] = "legacy",
         **kwargs: Any
     ) -> None:
         """
@@ -167,6 +250,7 @@ class FieldSpaceAttentionConfig:
         self.use_variable_mlp_gammas: bool
         self.use_indexed_att_gammas: bool
         self.use_indexed_mlp_gammas: bool
+        self.block_type: Literal["legacy", "ext"]
 
         def _resolve_alias(indexed_value: Optional[bool], legacy_value: bool) -> tuple[bool, bool]:
             resolved = legacy_value if indexed_value is None else indexed_value
@@ -174,6 +258,9 @@ class FieldSpaceAttentionConfig:
 
         n_depths_is_default = n_depths is None
         n_depths = 1 if n_depths is None else n_depths
+
+        if block_type not in {"legacy", "ext"}:
+            raise ValueError("block_type must be either 'legacy' or 'ext'")
 
         use_indexed_emb_layer, use_variable_emb_layer = _resolve_alias(use_indexed_emb_layer, use_variable_emb_layer)
         use_indexed_layer_norm, use_variable_layer_norm = _resolve_alias(use_indexed_layer_norm, use_variable_layer_norm)
@@ -206,7 +293,7 @@ class FieldSpaceAttentionModule(nn.Module):
         token_zoom: int,
         groups: Union[List[bool], int] = -1,
         target_zooms: Optional[List[int]] = None,
-        in_features: int = 1,
+        in_features: Union[List[int], int] = 1,
         n_groups_variables: List[int] = [1],
         n_groups_depths: Optional[List[int]] = None,
         shared_indexed_group_variables: Union[List[bool], bool] = False,
@@ -261,6 +348,7 @@ class FieldSpaceAttentionModule(nn.Module):
         global_embedders: Optional[nn.ModuleDict] = None,
         fac_mode: str = "Tucker",
         emb_aggregation: str = "shift_scale",
+        block_type: Literal["legacy", "ext"] = "legacy",
     ) -> None:
         """
         Initialize the field-space attention module.
@@ -319,6 +407,9 @@ class FieldSpaceAttentionModule(nn.Module):
         """
         super().__init__()
         
+        if block_type not in {"legacy", "ext"}:
+            raise ValueError("block_type must be either 'legacy' or 'ext'")
+
         # Normalize per-group configs so indexing is consistent across variable groups.
         n_groups = len(n_groups_variables)
         if isinstance(groups, (list, tuple, ListConfig)):
@@ -333,37 +424,54 @@ class FieldSpaceAttentionModule(nn.Module):
         else:
             raise ValueError("groups must be -1 or a list of bools")
 
-        if n_groups_depths is None:
-            n_groups_depths = [1] * n_groups
-        if len(n_groups_depths) != n_groups:
-            raise ValueError(f"n_groups_depths must have length {n_groups}, got {len(n_groups_depths)}")
-        shared_indexed_group_variables = check_value(shared_indexed_group_variables, n_groups)
-        shared_indexed_group_depths = check_value(shared_indexed_group_depths, n_groups)
-        shared_indexed_group_space = check_value(shared_indexed_group_space, n_groups)
+        n_groups_depths = _normalize_group_values(
+            1 if n_groups_depths is None else n_groups_depths,
+            n_groups,
+            "n_groups_depths",
+        )
+        shared_indexed_group_depths = _normalize_group_values(
+            shared_indexed_group_depths,
+            n_groups,
+            "shared_indexed_group_depths",
+        )
+        shared_indexed_group_variables = _collapse_shared_value(
+            shared_indexed_group_variables,
+            "shared_indexed_group_variables",
+        )
+        shared_indexed_group_space = _collapse_shared_value(
+            shared_indexed_group_space,
+            "shared_indexed_group_space",
+        )
 
         def _resolve_alias(indexed_value: Optional[bool], legacy_value: bool) -> bool:
             return legacy_value if indexed_value is None else indexed_value
 
-        token_len_depth = check_value(token_len_depth, n_groups)
-        token_len_time = check_value(token_len_time, n_groups)
-
-        token_overlap_space = check_value(token_overlap_space, n_groups)
-        token_overlap_time = check_value(token_overlap_time, n_groups)
-        token_overlap_depth = check_value(token_overlap_depth, n_groups)
-        token_overlap_mlp_time = check_value(token_overlap_mlp_time, n_groups)
-        token_overlap_mlp_depth = check_value(token_overlap_mlp_depth, n_groups)
-
-        rank_space = check_value(rank_space, n_groups)
-        n_rank_space = check_value(n_rank_space, n_groups)
-        rank_time = check_value(rank_time, n_groups)
-        rank_depth = check_value(rank_depth, n_groups)
-        rank_variables = check_value(rank_variables, n_groups)
-        rank_features = check_value(rank_features, n_groups)
-        n_times = check_value(n_times, n_groups)
+        token_len_depth = _normalize_group_values(token_len_depth, n_groups, "token_len_depth")
+        token_overlap_depth = _normalize_group_values(
+            token_overlap_depth, n_groups, "token_overlap_depth"
+        )
+        token_overlap_mlp_depth = _normalize_group_values(
+            token_overlap_mlp_depth, n_groups, "token_overlap_mlp_depth"
+        )
+        seq_len_depth = _normalize_group_values(seq_len_depth, n_groups, "seq_len_depth")
+        seq_overlap_depth = _normalize_group_values(
+            seq_overlap_depth, n_groups, "seq_overlap_depth"
+        )
         if n_depths is None:
             n_depths = list(n_groups_depths)
         else:
-            n_depths = check_value(n_depths, n_groups)
+            n_depths = _normalize_group_values(n_depths, n_groups, "n_depths")
+
+        # Non-depth settings never vary by group. Ext resolves the selected settings
+        # by zoom; legacy collapses uniform sequences to one shared scalar.
+        token_overlap_space = _collapse_shared_value(token_overlap_space, "token_overlap_space")
+        token_overlap_time = _collapse_shared_value(token_overlap_time, "token_overlap_time")
+        token_overlap_mlp_time = _collapse_shared_value(
+            token_overlap_mlp_time, "token_overlap_mlp_time"
+        )
+        seq_len_time = _collapse_shared_value(seq_len_time, "seq_len_time")
+        seq_overlap_space = _collapse_shared_value(seq_overlap_space, "seq_overlap_space")
+        seq_overlap_time = _collapse_shared_value(seq_overlap_time, "seq_overlap_time")
 
         use_indexed_emb_layer = _resolve_alias(use_indexed_emb_layer, use_variable_emb_layer)
         use_indexed_layer_norm = _resolve_alias(use_indexed_layer_norm, use_variable_layer_norm)
@@ -391,6 +499,62 @@ class FieldSpaceAttentionModule(nn.Module):
         # Compute unique set of zooms participating in attention.
         self.qkv_zooms: List[int] = torch.tensor(q_zooms + kv_zooms).unique().tolist()
 
+        target_zooms_block = q_zooms if target_zooms is None else list(target_zooms)
+        required_zooms = list(dict.fromkeys([*q_zooms, *kv_zooms, *target_zooms_block]))
+        missing_zooms = [zoom for zoom in required_zooms if zoom not in in_zooms]
+        if missing_zooms:
+            raise ValueError(f"Attention zooms {missing_zooms} are not present in in_zooms")
+
+        if block_type == "ext":
+            if list(q_zooms) != list(kv_zooms):
+                raise ValueError(
+                    "Ext field-space attention requires identical q_zooms and kv_zooms"
+                )
+            per_zoom_values = {
+                "in_features": _normalize_axis_values(in_features, in_zooms, "in_features"),
+                "token_len_time": _normalize_axis_values(
+                    token_len_time, in_zooms, "token_len_time"
+                ),
+                "rank_variables": _normalize_axis_values(
+                    rank_variables, in_zooms, "rank_variables"
+                ),
+                "rank_space": _normalize_axis_values(rank_space, in_zooms, "rank_space"),
+                "n_rank_space": _normalize_axis_values(
+                    n_rank_space, in_zooms, "n_rank_space"
+                ),
+                "rank_time": _normalize_axis_values(rank_time, in_zooms, "rank_time"),
+                "rank_features": _normalize_axis_values(
+                    rank_features, in_zooms, "rank_features"
+                ),
+                "n_times": _normalize_axis_values(n_times, in_zooms, "n_times"),
+            }
+            rank_depth_by_group = _normalize_ext_rank_depth(
+                rank_depth, n_groups, in_zooms
+            )
+        else:
+            per_zoom_values = {}
+            legacy_shared_values = {
+                "in_features": _collapse_shared_value(in_features, "in_features"),
+                "token_len_time": _collapse_shared_value(
+                    token_len_time, "token_len_time"
+                ),
+                "rank_variables": _collapse_shared_value(
+                    rank_variables, "rank_variables"
+                ),
+                "rank_space": _collapse_shared_value(rank_space, "rank_space"),
+                "n_rank_space": _collapse_shared_value(
+                    n_rank_space, "n_rank_space"
+                ),
+                "rank_time": _collapse_shared_value(rank_time, "rank_time"),
+                "rank_features": _collapse_shared_value(
+                    rank_features, "rank_features"
+                ),
+                "n_times": _collapse_shared_value(n_times, "n_times"),
+            }
+            rank_depth_by_group = _normalize_group_values(
+                rank_depth, n_groups, "rank_depth"
+            )
+
         seq_zoom = min((min(q_zooms + kv_zooms)), seq_len_zoom)  
 
         if (min(q_zooms + kv_zooms)) < token_zoom:
@@ -415,8 +579,17 @@ class FieldSpaceAttentionModule(nn.Module):
             if not is_active:
                 continue
             
-            # Each group gets its own attention block with group-specific config.
-            block = FieldSpaceAttentionBlock(
+            block_class = (
+                ExtFieldSpaceAttentionBlock
+                if block_type == "ext"
+                else FieldSpaceAttentionBlock
+            )
+            zoom_or_shared = (
+                per_zoom_values if block_type == "ext" else legacy_shared_values
+            )
+
+            # Each group gets its own block. Only depth settings differ by group.
+            block = block_class(
                         grid_layers,
                         token_zoom,
                         seq_zoom if seq_zoom > -1 else -1,
@@ -425,30 +598,31 @@ class FieldSpaceAttentionModule(nn.Module):
                         att_dim,
                         att_dim_mixed = att_dim_mixed,
                         target_zooms = target_zooms,
-                        in_features = in_features,
+                        in_features = zoom_or_shared["in_features"],
+                        in_zooms=in_zooms,
                         token_len_depth= token_len_depth[k],
-                        token_len_time= token_len_time[k],
-                        token_overlap_space= token_overlap_space[k],
-                        token_overlap_time= token_overlap_time[k],
+                        token_len_time= zoom_or_shared["token_len_time"],
+                        token_overlap_space= token_overlap_space,
+                        token_overlap_time= token_overlap_time,
                         token_overlap_depth= token_overlap_depth[k],
-                        token_overlap_mlp_time= token_overlap_mlp_time[k],
+                        token_overlap_mlp_time= token_overlap_mlp_time,
                         token_overlap_mlp_depth= token_overlap_mlp_depth[k],
-                        shared_indexed_variables=shared_indexed_group_variables[k],
+                        shared_indexed_variables=shared_indexed_group_variables,
                         shared_indexed_depths=shared_indexed_group_depths[k],
-                        shared_indexed_space=shared_indexed_group_space[k],
-                        rank_space = rank_space[k],
-                        n_rank_space = n_rank_space[k],
-                        rank_time = rank_time[k],
-                        rank_depth = rank_depth[k],
-                        rank_features = rank_features[k],
-                        rank_variables = rank_variables[k],
-                        n_times = n_times[k],
+                        shared_indexed_space=shared_indexed_group_space,
+                        rank_space = zoom_or_shared["rank_space"],
+                        n_rank_space = zoom_or_shared["n_rank_space"],
+                        rank_time = zoom_or_shared["rank_time"],
+                        rank_depth = rank_depth_by_group[k],
+                        rank_features = zoom_or_shared["rank_features"],
+                        rank_variables = zoom_or_shared["rank_variables"],
+                        n_times = zoom_or_shared["n_times"],
                         n_depths = n_depths[k],
                         seq_len_time= seq_len_time,
-                        seq_len_depth= seq_len_depth,
+                        seq_len_depth= seq_len_depth[k],
                         seq_overlap_space = seq_overlap_space,
                         seq_overlap_time = seq_overlap_time,
-                        seq_overlap_depth = seq_overlap_depth,
+                        seq_overlap_depth = seq_overlap_depth[k],
                         with_var_att = with_var_att,
                         n_head_channels = n_head_channels,
                         dropout=dropout,
@@ -479,7 +653,7 @@ class FieldSpaceAttentionModule(nn.Module):
                         )
             self.blocks.append(block)
 
-        self.block: Optional[FieldSpaceAttentionBlock] = block
+        self.block: Optional[Union[FieldSpaceAttentionBlock, ExtFieldSpaceAttentionBlock]] = block
         self.concat_dim = -2 if with_var_att else 0
     
     def forward(
@@ -614,6 +788,7 @@ class FieldSpaceAttentionBlock(nn.Module):
         use_variable_mlp_gammas: bool = False,
         use_indexed_att_gammas: Optional[bool] = None,
         use_indexed_mlp_gammas: Optional[bool] = None,
+        in_zooms: Optional[List[int]] = None,
     ) -> None:
         """
         Initialize a field-space attention block.
@@ -1398,6 +1573,1039 @@ class FieldSpaceAttentionBlock(nn.Module):
             mask_zooms=mask_zooms,
         )
         att_out = safe_scaled_dot_product_attention(q, K, V, mask=mask)
+        return self.forward_mlp(
+            x_zooms,
+            x_base,
+            att_out,
+            shape,
+            emb=emb,
+            sample_configs=sample_configs,
+        )
+
+
+class ExtFieldSpaceAttentionBlock(FieldSpaceAttentionBlock):
+    """Extendable field-space attention with registered per-zoom input/output paths."""
+
+    def __init__(
+        self,
+        grid_layers: Dict[str, GridLayer],
+        token_zoom: int,
+        seq_zoom: int,
+        q_zooms: List[int],
+        kv_zooms: List[int],
+        att_dim: int,
+        att_dim_mixed: int = 0,
+        target_zooms: Optional[List[int]] = None,
+        in_features: Union[Mapping[int, int], Sequence[int], int] = 1,
+        token_len_depth: int = 1,
+        token_len_time: Union[Mapping[int, int], Sequence[int], int] = 1,
+        token_overlap_space: bool = False,
+        token_overlap_time: bool = False,
+        token_overlap_depth: bool = False,
+        token_overlap_mlp_time: bool = False,
+        token_overlap_mlp_depth: bool = False,
+        shared_indexed_variables: bool = False,
+        shared_indexed_depths: bool = False,
+        shared_indexed_space: bool = False,
+        rank_space: Union[Mapping[int, Optional[int]], Sequence[Optional[int]], Optional[int]] = None,
+        n_rank_space: Union[Mapping[int, Optional[int]], Sequence[Optional[int]], Optional[int]] = None,
+        rank_time: Union[Mapping[int, Optional[int]], Sequence[Optional[int]], Optional[int]] = None,
+        rank_depth: Union[Mapping[int, Optional[int]], Sequence[Optional[int]], Optional[int]] = None,
+        rank_features: Union[Mapping[int, Optional[int]], Sequence[Optional[int]], Optional[int]] = None,
+        rank_variables: Union[Mapping[int, Optional[int]], Sequence[Optional[int]], Optional[int]] = None,
+        n_times: Union[Mapping[int, int], Sequence[int], int] = 1,
+        n_depths: int = 1,
+        dropout: float = 0.0,
+        n_head_channels: int = 32,
+        embed_confs: Dict[str, Any] = {},
+        embedder: Optional[nn.Module] = None,
+        embedder_cache_key: Optional[str] = None,
+        seq_len_time: int = -1,
+        seq_len_depth: int = -1,
+        seq_overlap_space: bool = False,
+        seq_overlap_time: bool = False,
+        seq_overlap_depth: bool = False,
+        with_var_att: bool = False,
+        n_variables: int = 1,
+        fac_mode: str = "Tucker",
+        emb_aggregation: str = "shift_scale",
+        update: str = "shift",
+        layer_norm: bool = True,
+        separate_mlp_norm: bool = False,
+        mlp_residual_from_attention: bool = False,
+        use_variable_emb_layer: bool = True,
+        use_variable_layer_norm: bool = True,
+        use_variable_qkv: bool = True,
+        use_variable_mlp: bool = True,
+        use_indexed_emb_layer: Optional[bool] = None,
+        use_indexed_layer_norm: Optional[bool] = None,
+        use_indexed_qkv: Optional[bool] = None,
+        use_indexed_mlp: Optional[bool] = None,
+        use_ranks_emb_layer: bool = True,
+        use_ranks_qkv: bool = True,
+        use_ranks_mlp: bool = True,
+        use_variable_att_gammas: bool = False,
+        use_variable_mlp_gammas: bool = False,
+        use_indexed_att_gammas: Optional[bool] = None,
+        use_indexed_mlp_gammas: Optional[bool] = None,
+        in_zooms: Optional[List[int]] = None,
+    ) -> None:
+        nn.Module.__init__(self)
+
+        if list(q_zooms) != list(kv_zooms):
+            raise ValueError(
+                "Ext field-space attention requires identical q_zooms and kv_zooms"
+            )
+        if update not in {"shift", "shift_scale"}:
+            raise ValueError("update must be either 'shift' or 'shift_scale'")
+
+        self.in_zooms = list(q_zooms if in_zooms is None else in_zooms)
+        self.q_zooms = [int(zoom) for zoom in q_zooms]
+        self.kv_zooms = [int(zoom) for zoom in kv_zooms]
+        self.target_zooms = [
+            int(zoom) for zoom in (self.q_zooms if target_zooms is None else target_zooms)
+        ]
+        required_zooms = set([*self.q_zooms, *self.target_zooms])
+        missing = sorted(required_zooms.difference(self.in_zooms))
+        if missing:
+            raise ValueError(f"Ext zooms {missing} are not present in in_zooms")
+
+        self.in_features_by_zoom = {
+            zoom: int(value)
+            for zoom, value in _normalize_axis_values(
+                in_features, self.in_zooms, "in_features"
+            ).items()
+        }
+        self.token_len_time_by_zoom = {
+            zoom: int(value)
+            for zoom, value in _normalize_axis_values(
+                token_len_time, self.in_zooms, "token_len_time"
+            ).items()
+        }
+        self.rank_space_by_zoom = _normalize_axis_values(
+            rank_space, self.in_zooms, "rank_space"
+        )
+        self.n_rank_space_by_zoom = _normalize_axis_values(
+            n_rank_space, self.in_zooms, "n_rank_space"
+        )
+        self.rank_time_by_zoom = _normalize_axis_values(
+            rank_time, self.in_zooms, "rank_time"
+        )
+        self.rank_depth_by_zoom = _normalize_axis_values(
+            rank_depth, self.in_zooms, "rank_depth"
+        )
+        self.rank_features_by_zoom = _normalize_axis_values(
+            rank_features, self.in_zooms, "rank_features"
+        )
+        self.rank_variables_by_zoom = _normalize_axis_values(
+            rank_variables, self.in_zooms, "rank_variables"
+        )
+        self.n_times_by_zoom = {
+            zoom: int(value)
+            for zoom, value in _normalize_axis_values(
+                n_times, self.in_zooms, "n_times"
+            ).items()
+        }
+
+        self.token_zoom = int(token_zoom)
+        self.token_len_depth = int(token_len_depth)
+        self.token_overlap_space = bool(token_overlap_space)
+        self.token_overlap_time = bool(token_overlap_time)
+        self.token_overlap_depth = bool(token_overlap_depth)
+        self.token_overlap_mlp_time = bool(token_overlap_mlp_time)
+        self.token_overlap_mlp_depth = bool(token_overlap_mlp_depth)
+        self.n_depths = int(n_depths)
+        self.n_variables = int(n_variables)
+        self.att_dim = int(att_dim)
+        self.att_dim_mixed = int(att_dim_mixed)
+        self.att_dim_total = self.att_dim + self.att_dim_mixed
+        self.n_head_channels = int(n_head_channels)
+        if self.att_dim_total % self.n_head_channels != 0:
+            raise ValueError(
+                f"att_dim + att_dim_mixed ({self.att_dim_total}) must be divisible "
+                f"by n_head_channels ({self.n_head_channels})"
+            )
+
+        self.scale_shift = update == "shift_scale"
+        self.update_multiplier = 2 if self.scale_shift else 1
+        self.separate_mlp_norm = bool(separate_mlp_norm)
+        self.mlp_residual_from_attention = bool(mlp_residual_from_attention)
+        self.dropout_att = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.dropout_mlp = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.mlp_activation = nn.SiLU()
+
+        def resolve_flag(new: Optional[bool], legacy: bool) -> bool:
+            return bool(legacy if new is None else new)
+
+        self.use_indexed_emb_layer = resolve_flag(
+            use_indexed_emb_layer, use_variable_emb_layer
+        )
+        self.use_indexed_layer_norm = resolve_flag(
+            use_indexed_layer_norm, use_variable_layer_norm
+        )
+        self.use_indexed_qkv = resolve_flag(use_indexed_qkv, use_variable_qkv)
+        self.use_indexed_mlp = resolve_flag(use_indexed_mlp, use_variable_mlp)
+        self.use_indexed_att_gammas = resolve_flag(
+            use_indexed_att_gammas, use_variable_att_gammas
+        )
+        self.use_indexed_mlp_gammas = resolve_flag(
+            use_indexed_mlp_gammas, use_variable_mlp_gammas
+        )
+        self.use_variable_emb_layer = bool(use_variable_emb_layer)
+        self.use_variable_layer_norm = bool(use_variable_layer_norm)
+        self.use_variable_qkv = bool(use_variable_qkv)
+        self.use_variable_mlp = bool(use_variable_mlp)
+        self.use_ranks_emb_layer = bool(use_ranks_emb_layer)
+        self.use_ranks_qkv = bool(use_ranks_qkv)
+        self.use_ranks_mlp = bool(use_ranks_mlp)
+        self.shared_indexed_variables = bool(shared_indexed_variables)
+        self.shared_indexed_depths = bool(shared_indexed_depths)
+        self.shared_indexed_space = bool(shared_indexed_space)
+        self.fac_mode = fac_mode
+
+        self.grid_layer_field = (
+            grid_layers[str(token_zoom)] if token_zoom > -1 else grid_layers[str(0)]
+        )
+        self.grid_layer_att = grid_layers[str(seq_zoom)] if seq_zoom > -1 else -1
+        self._configure_ext_attention_layout(
+            seq_zoom=seq_zoom,
+            seq_len_time=seq_len_time,
+            seq_len_depth=seq_len_depth,
+            seq_overlap_space=seq_overlap_space,
+            seq_overlap_time=seq_overlap_time,
+            seq_overlap_depth=seq_overlap_depth,
+            with_var_att=with_var_att,
+        )
+
+        input_zoom_field = embed_confs.get("input_zoom", min(self.q_zooms))
+        if embedder is None:
+            embedder = get_embedder(
+                **embed_confs,
+                grid_layers=grid_layers,
+                zoom=input_zoom_field,
+            )
+        self.embedder = embedder
+
+        self.tokenizers = nn.ModuleDict()
+        self.update_tokenizers = nn.ModuleDict()
+        self.pre_layers = nn.ModuleDict()
+        self.mlp_pre_layers = nn.ModuleDict()
+        self.qkv_projection_layers = nn.ModuleDict()
+        self.qkv_projection_layers_mixed = nn.ModuleDict()
+        self.mlp_projection_layers = nn.ModuleDict()
+        self.out_layers_att = nn.ModuleDict()
+        self.out_layers_mlp = nn.ModuleDict()
+        self.att_gammas = nn.ParameterDict()
+        self.att_res_gammas = nn.ParameterDict()
+        self.mlp_gammas = nn.ParameterDict()
+        self.mlp_res_gammas = nn.ParameterDict()
+        self.indexed_dims_by_zoom: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self.indexed_dims_mlp_by_zoom: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self.indexed_dims_att_gamma_by_zoom: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self.indexed_dims_mlp_gamma_by_zoom: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self.token_shapes_by_zoom: Dict[int, List[int]] = {}
+        self.update_shapes_by_zoom: Dict[int, List[int]] = {}
+
+        processing_zooms = list(dict.fromkeys([*self.q_zooms, *self.target_zooms]))
+        for zoom in processing_zooms:
+            key = str(zoom)
+            tokenizer = Tokenizer(
+                [zoom],
+                token_zoom,
+                overlap_thickness=int(token_overlap_space),
+                grid_layers=grid_layers,
+                token_len_time=self.token_len_time_by_zoom[zoom],
+                token_len_depth=self.token_len_depth,
+            )
+            update_tokenizer = Tokenizer(
+                [zoom],
+                token_zoom,
+                overlap_thickness=0,
+                grid_layers=grid_layers,
+                token_len_time=self.token_len_time_by_zoom[zoom],
+                token_len_depth=self.token_len_depth,
+            )
+            self.tokenizers[key] = tokenizer
+            self.update_tokenizers[key] = update_tokenizer
+
+            n_space = sum(tokenizer.get_features()[0].values())
+            n_space_update = sum(update_tokenizer.get_features()[1].values())
+            feature_count = self.in_features_by_zoom[zoom]
+            token_shape = [
+                self.token_len_time_by_zoom[zoom],
+                n_space,
+                self.token_len_depth,
+                feature_count,
+            ]
+            update_shape = [
+                self.token_len_time_by_zoom[zoom],
+                n_space_update,
+                self.token_len_depth,
+                feature_count,
+            ]
+            self.token_shapes_by_zoom[zoom] = token_shape
+            self.update_shapes_by_zoom[zoom] = update_shape
+
+            indexed_emb = self._build_ext_indexed_dims(
+                zoom,
+                enabled=self.use_indexed_emb_layer,
+                n_variables_local=(
+                    self.n_variables if self.use_variable_emb_layer else 1
+                ),
+                rank_variables_local=(
+                    self.rank_variables_by_zoom[zoom]
+                    if self.use_ranks_emb_layer else None
+                ),
+            )
+            indexed_norm = self._build_ext_indexed_dims(
+                zoom,
+                enabled=self.use_indexed_layer_norm,
+                n_variables_local=(
+                    self.n_variables if self.use_variable_layer_norm else 1
+                ),
+                rank_variables_local=None,
+            )
+            indexed_qkv = self._build_ext_indexed_dims(
+                zoom,
+                enabled=self.use_indexed_qkv,
+                n_variables_local=(
+                    self.n_variables if self.use_variable_qkv else 1
+                ),
+                rank_variables_local=(
+                    self.rank_variables_by_zoom[zoom]
+                    if self.use_ranks_qkv else None
+                ),
+            )
+            indexed_mlp = self._build_ext_indexed_dims(
+                zoom,
+                enabled=self.use_indexed_mlp,
+                n_variables_local=(
+                    self.n_variables if self.use_variable_mlp else 1
+                ),
+                rank_variables_local=(
+                    self.rank_variables_by_zoom[zoom]
+                    if self.use_ranks_mlp else None
+                ),
+            )
+            self.indexed_dims_by_zoom[zoom] = indexed_qkv
+            self.indexed_dims_mlp_by_zoom[zoom] = indexed_mlp
+            self.indexed_dims_att_gamma_by_zoom[zoom] = (
+                self._build_ext_indexed_dims(
+                    zoom,
+                    enabled=self.use_indexed_att_gammas,
+                    n_variables_local=self.n_variables,
+                    rank_variables_local=None,
+                )
+            )
+            self.indexed_dims_mlp_gamma_by_zoom[zoom] = (
+                self._build_ext_indexed_dims(
+                    zoom,
+                    enabled=self.use_indexed_mlp_gammas,
+                    n_variables_local=self.n_variables,
+                    rank_variables_local=None,
+                )
+            )
+
+            ranks = self._ext_ranks_for_zoom(zoom)
+            emb_ranks = embed_confs.get("ranks", [*ranks, None])
+            if not self.use_ranks_emb_layer:
+                emb_ranks = [None] * len(emb_ranks)
+            pre_layer = self._build_ext_pre_layer(
+                zoom=zoom,
+                token_shape=token_shape,
+                tokenizer=tokenizer,
+                input_zoom_field=input_zoom_field,
+                grid_layers=grid_layers,
+                embed_confs=embed_confs,
+                embedder=embedder,
+                embedder_cache_key=embedder_cache_key,
+                ranks=ranks if self.use_ranks_emb_layer else [None] * len(ranks),
+                emb_ranks=emb_ranks,
+                indexed_emb=indexed_emb,
+                indexed_norm=indexed_norm,
+                layer_norm=layer_norm,
+                emb_aggregation=emb_aggregation,
+            )
+            self.pre_layers[key] = pre_layer
+            if self.separate_mlp_norm:
+                self.mlp_pre_layers[key] = self._build_ext_pre_layer(
+                    zoom=zoom,
+                    token_shape=token_shape,
+                    tokenizer=tokenizer,
+                    input_zoom_field=input_zoom_field,
+                    grid_layers=grid_layers,
+                    embed_confs=embed_confs,
+                    embedder=embedder,
+                    embedder_cache_key=embedder_cache_key,
+                    ranks=ranks if self.use_ranks_emb_layer else [None] * len(ranks),
+                    emb_ranks=emb_ranks,
+                    indexed_emb=indexed_emb,
+                    indexed_norm=indexed_norm,
+                    layer_norm=layer_norm,
+                    emb_aggregation=emb_aggregation,
+                )
+
+            qkv_in_shape = [
+                token_shape[0] + 2 * int(self.token_overlap_time),
+                token_shape[1],
+                token_shape[2] + 2 * int(self.token_overlap_depth),
+                token_shape[3],
+            ]
+            qkv_ranks = ranks if self.use_ranks_qkv else [None] * len(ranks)
+            self.qkv_projection_layers[key] = get_layer(
+                qkv_in_shape,
+                [1, 1, 1, 3 * self.att_dim],
+                ranks=qkv_ranks,
+                n_variables=(
+                    self.n_variables if self.use_variable_qkv else 1
+                ),
+                indexed_dims=indexed_qkv,
+                fac_mode=fac_mode,
+                rank_variables=(
+                    self.rank_variables_by_zoom[zoom]
+                    if self.use_ranks_qkv else None
+                ),
+                bias=False,
+            )
+            if self.att_dim_mixed > 0:
+                if self.n_variables <= 1:
+                    raise ValueError(
+                        "n_variables must be greater than one when att_dim_mixed > 0"
+                    )
+                mixed_in_shape = [
+                    *qkv_in_shape[:-1],
+                    qkv_in_shape[-1] * self.n_variables,
+                ]
+                self.qkv_projection_layers_mixed[key] = get_layer(
+                    mixed_in_shape,
+                    [1, 1, 1, 3 * self.att_dim_mixed],
+                    ranks=qkv_ranks,
+                    n_variables=1,
+                    indexed_dims={},
+                    fac_mode=fac_mode,
+                    bias=False,
+                )
+
+            mlp_in_shape = [
+                token_shape[0] + 2 * int(self.token_overlap_mlp_time),
+                token_shape[1],
+                token_shape[2] + 2 * int(self.token_overlap_mlp_depth),
+                token_shape[3],
+            ]
+            mlp_ranks = ranks if self.use_ranks_mlp else [None] * len(ranks)
+            self.mlp_projection_layers[key] = get_layer(
+                mlp_in_shape,
+                [1, 1, 1, self.att_dim_total],
+                ranks=mlp_ranks,
+                n_variables=(
+                    self.n_variables if self.use_variable_mlp else 1
+                ),
+                indexed_dims=indexed_mlp,
+                fac_mode=fac_mode,
+                rank_variables=(
+                    self.rank_variables_by_zoom[zoom]
+                    if self.use_ranks_mlp else None
+                ),
+                bias=False,
+            )
+
+            if zoom in self.target_zooms:
+                output_shape = [
+                    *update_shape[:-1],
+                    update_shape[-1] * self.update_multiplier,
+                ]
+                self.out_layers_att[key] = get_layer(
+                    [1, 1, 1, self.att_dim_total],
+                    output_shape,
+                    ranks=qkv_ranks,
+                    n_variables=(
+                        self.n_variables if self.use_variable_qkv else 1
+                    ),
+                    indexed_dims=indexed_qkv,
+                    fac_mode=fac_mode,
+                    rank_variables=(
+                        self.rank_variables_by_zoom[zoom]
+                        if self.use_ranks_qkv else None
+                    ),
+                    bias=False,
+                )
+                self.out_layers_mlp[key] = get_layer(
+                    [1, 1, 1, self.att_dim_total],
+                    output_shape,
+                    ranks=mlp_ranks,
+                    n_variables=(
+                        self.n_variables if self.use_variable_mlp else 1
+                    ),
+                    indexed_dims=indexed_mlp,
+                    fac_mode=fac_mode,
+                    rank_variables=(
+                        self.rank_variables_by_zoom[zoom]
+                        if self.use_ranks_mlp else None
+                    ),
+                    bias=False,
+                )
+                self._register_ext_gammas(zoom, update_shape)
+
+        shared_shape = [1, 1, 1, self.att_dim_total]
+        self.mlp_layer1 = get_layer(
+            shared_shape,
+            shared_shape,
+            ranks=[None] * 5,
+            n_variables=1,
+            indexed_dims={},
+            fac_mode=fac_mode,
+            bias=False,
+        )
+        self.mlp_layer2 = get_layer(
+            shared_shape,
+            shared_shape,
+            ranks=[None] * 5,
+            n_variables=1,
+            indexed_dims={},
+            fac_mode=fac_mode,
+            bias=False,
+        )
+
+    def _configure_ext_attention_layout(
+        self,
+        *,
+        seq_zoom: int,
+        seq_len_time: int,
+        seq_len_depth: int,
+        seq_overlap_space: bool,
+        seq_overlap_time: bool,
+        seq_overlap_depth: bool,
+        with_var_att: bool,
+    ) -> None:
+        global_att = isinstance(self.grid_layer_att, int) and self.grid_layer_att == -1
+        self.seq_overlap_space = bool(seq_overlap_space) and not global_att
+        self.seq_overlap_time = bool(seq_overlap_time)
+        self.seq_overlap_depth = bool(seq_overlap_depth)
+        self.rearrange_dict: Dict[str, int] = {}
+        if global_att:
+            self.rearrange_dict["N"] = 1
+        else:
+            self.rearrange_dict["n"] = 4 ** (
+                self.grid_layer_field.zoom - self.grid_layer_att.zoom
+            )
+        if seq_len_time == -1:
+            self.rearrange_dict["T"] = 1
+            self.seq_overlap_time = False
+        else:
+            self.rearrange_dict["t"] = int(seq_len_time)
+        if seq_len_depth == -1:
+            self.rearrange_dict["D"] = 1
+            self.seq_overlap_depth = False
+        else:
+            self.rearrange_dict["d"] = int(seq_len_depth)
+
+        self.rearrange_dict_nh = dict(self.rearrange_dict)
+        if seq_zoom > -1:
+            self.rearrange_dict_nh["n"] = (
+                self.grid_layer_att.adjc.shape[-1]
+                * 4 ** (self.token_zoom - seq_zoom)
+            )
+
+        self.att_pattern_chunks = (
+            "b v (T t) (N n) (D d) 1 1 1 f -> b v T N D t n d f"
+        )
+        self.att_pattern_chunks_w_nh = (
+            "b v (T t) N n (D d) 1 1 1 f -> b v T N D t n d f"
+        )
+        if with_var_att:
+            self.att_pattern = (
+                "b v T N D t n d (NH H) -> (b T N D) NH (v t n d) H"
+            )
+            self.mask_pattern = (
+                "b v T N D t n d 1 -> (b T N D) 1 1 (v t n d)"
+            )
+            self.att_pattern_reverse = (
+                "(b T N D) NH (v t n d) H -> "
+                "b v (T t) (N n) (D d) 1 1 1 (NH H)"
+            )
+        else:
+            self.att_pattern = (
+                "b v T N D t n d (NH H) -> (b v T N D) NH (t n d) H"
+            )
+            self.mask_pattern = (
+                "b v T N D t n d 1 -> (b v T N D) 1 1 (t n d)"
+            )
+            self.att_pattern_reverse = (
+                "(b v T N D) NH (t n d) H -> "
+                "b v (T t) (N n) (D d) 1 1 1 (NH H)"
+            )
+
+    def _ext_ranks_for_zoom(self, zoom: int) -> List[Optional[int]]:
+        return [
+            self.rank_time_by_zoom[zoom],
+            self.rank_space_by_zoom[zoom],
+            self.rank_depth_by_zoom[zoom],
+            self.rank_features_by_zoom[zoom],
+            self.rank_features_by_zoom[zoom],
+        ]
+
+    def _build_ext_indexed_dims(
+        self,
+        zoom: int,
+        *,
+        enabled: bool,
+        n_variables_local: int,
+        rank_variables_local: Optional[int],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not enabled:
+            return {}
+        indexed_n_depths = (
+            max(1, self.n_depths // max(1, self.token_len_depth))
+            if self.n_depths > 1 else 1
+        )
+        n_rank_space = self.n_rank_space_by_zoom[zoom]
+        indexed_n_space = (
+            12 * 4**self.token_zoom
+            if n_rank_space is not None
+            and int(n_rank_space) > 0
+            and self.token_zoom >= 0
+            else 1
+        )
+        return build_indexed_dims(
+            n_variables=int(n_variables_local),
+            rank_variables=rank_variables_local,
+            same_values_variables=self.shared_indexed_variables,
+            n_times=(
+                self.n_times_by_zoom[zoom]
+                if self.n_times_by_zoom[zoom] > 1 else 1
+            ),
+            n_space=indexed_n_space,
+            rank_space=(
+                int(n_rank_space) if indexed_n_space > 1 else None
+            ),
+            same_values_space=self.shared_indexed_space,
+            n_depths=indexed_n_depths,
+            same_values_depths=self.shared_indexed_depths,
+        )
+
+    def _build_ext_pre_layer(
+        self,
+        *,
+        zoom: int,
+        token_shape: List[int],
+        tokenizer: Tokenizer,
+        input_zoom_field: int,
+        grid_layers: Dict[str, GridLayer],
+        embed_confs: Dict[str, Any],
+        embedder: Optional[nn.Module],
+        embedder_cache_key: Optional[str],
+        ranks: List[Optional[int]],
+        emb_ranks: List[Optional[int]],
+        indexed_emb: Dict[str, Dict[str, Any]],
+        indexed_norm: Dict[str, Dict[str, Any]],
+        layer_norm: bool,
+        emb_aggregation: str,
+    ) -> LinEmbLayer:
+        emb_tokenizer = Tokenizer(
+            [input_zoom_field] if embedder and embedder.has_space() else [],
+            self.token_zoom,
+            token_len_time=(
+                self.token_len_time_by_zoom[zoom]
+                if embedder and embedder.has_time() else 1
+            ),
+            token_len_depth=(
+                self.token_len_depth if embedder and embedder.has_depth() else 1
+            ),
+            overlap_thickness=int(
+                embed_confs.get("token_overlap_space", False)
+            ),
+            grid_layers=grid_layers,
+        )
+        emb_shape = copy.deepcopy(token_shape)
+        emb_shape[1] = (
+            token_shape[1] if embedder and embedder.has_space() else 1
+        )
+        return LinEmbLayer(
+            emb_shape,
+            emb_shape,
+            ranks=ranks,
+            n_variables=(
+                self.n_variables if self.use_variable_emb_layer else 1
+            ),
+            n_variable_norm=(
+                self.n_variables if self.use_variable_layer_norm else 1
+            ),
+            indexed_dims=indexed_emb,
+            indexed_dims_norm=indexed_norm,
+            fac_mode=self.fac_mode,
+            identity_if_equal=True,
+            embedder=embedder,
+            field_tokenizer=emb_tokenizer,
+            output_zoom=zoom,
+            layer_norm=layer_norm,
+            emb_aggregation=emb_aggregation,
+            emb_ranks=emb_ranks,
+            embedder_cache_key=embedder_cache_key,
+        )
+
+    def _register_ext_gammas(self, zoom: int, token_shape: List[int]) -> None:
+        key = str(zoom)
+        att_indexed_shape = [
+            spec["n_features"]
+            for spec in self.indexed_dims_att_gamma_by_zoom[zoom].values()
+        ]
+        mlp_indexed_shape = [
+            spec["n_features"]
+            for spec in self.indexed_dims_mlp_gamma_by_zoom[zoom].values()
+        ]
+        att_shape = (
+            [*att_indexed_shape, *token_shape]
+            if self.use_indexed_att_gammas else token_shape
+        )
+        mlp_shape = (
+            [*mlp_indexed_shape, *token_shape]
+            if self.use_indexed_mlp_gammas else token_shape
+        )
+        self.att_gammas[key] = nn.Parameter(torch.ones(att_shape) * 1e-12)
+        self.att_res_gammas[key] = nn.Parameter(torch.ones(att_shape) * 1e-12)
+        self.mlp_gammas[key] = nn.Parameter(torch.ones(mlp_shape) * 1e-12)
+        self.mlp_res_gammas[key] = nn.Parameter(torch.ones(mlp_shape) * 1e-12)
+
+    def _preprocess_ext_zoom(
+        self,
+        zoom: int,
+        x_zooms: Dict[int, torch.Tensor],
+        emb: Optional[Dict[str, Any]],
+        sample_configs: Dict[int, Dict[str, Any]],
+        *,
+        mlp: bool,
+    ) -> torch.Tensor:
+        key = str(zoom)
+        x = self.tokenizers[key]({zoom: x_zooms[zoom]}, sample_configs)
+        pre_layer = (
+            self.mlp_pre_layers[key]
+            if mlp and self.separate_mlp_norm
+            else self.pre_layers[key]
+        )
+        x = pre_layer(x, emb=emb, sample_configs=sample_configs)
+        return self.get_time_depth_overlaps(
+            x,
+            overlap_time=(
+                self.token_overlap_mlp_time if mlp else self.token_overlap_time
+            ),
+            overlap_depth=(
+                self.token_overlap_mlp_depth if mlp else self.token_overlap_depth
+            ),
+        )
+
+    @staticmethod
+    def _sum_ext_projections(
+        projections: List[torch.Tensor],
+        branch_name: str,
+    ) -> torch.Tensor:
+        if not projections:
+            raise ValueError(f"{branch_name} has no zoom projections")
+        expected = projections[0].shape
+        for index, projection in enumerate(projections[1:], start=1):
+            if projection.shape != expected:
+                raise ValueError(
+                    f"{branch_name} zoom projections must have identical shapes; "
+                    f"projection 0 has {tuple(expected)}, projection {index} has "
+                    f"{tuple(projection.shape)}"
+                )
+        return torch.stack(projections, dim=0).sum(dim=0)
+
+    def _pack_ext_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        sample_configs: Dict[int, Dict[str, Any]],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Dict[str, int],
+    ]:
+        q = rearrange(q, self.att_pattern_chunks, **self.rearrange_dict)
+        kv = torch.cat((k, v), dim=-1)
+        if self.seq_overlap_space:
+            kv, mask = self.grid_layer_att.get_nh(
+                kv,
+                input_zoom=self.grid_layer_field.zoom,
+                sample_configs=sample_configs[self.grid_layer_field.zoom],
+                mask=mask,
+            )
+            kv = rearrange(
+                kv,
+                self.att_pattern_chunks_w_nh,
+                **self.rearrange_dict_nh,
+            )
+        else:
+            kv = rearrange(kv, self.att_pattern_chunks, **self.rearrange_dict)
+        kv = self.get_time_depth_overlaps(
+            kv,
+            overlap_time=self.seq_overlap_time,
+            overlap_depth=self.seq_overlap_depth,
+        )
+        if mask is not None:
+            mask = self.get_time_depth_overlaps(
+                mask,
+                overlap_time=self.seq_overlap_time,
+                overlap_depth=self.seq_overlap_depth,
+            )
+        k, v = kv.chunk(2, dim=-1)
+        b, variables, t_outer, n_outer, d_outer, t, n, d, _ = q.shape
+        q = rearrange(q, self.att_pattern, H=self.n_head_channels)
+        k = rearrange(k, self.att_pattern, H=self.n_head_channels)
+        v = rearrange(v, self.att_pattern, H=self.n_head_channels)
+        mask = rearrange(mask, self.mask_pattern) if mask is not None else None
+        shape = {
+            "b": b,
+            "v": variables,
+            "T": t_outer,
+            "N": n_outer,
+            "D": d_outer,
+            "t": t,
+            "n": n,
+            "d": d,
+        }
+        return q, k, v, mask, shape
+
+    def _ext_gamma(
+        self,
+        gamma: torch.Tensor,
+        zoom: int,
+        reference: torch.Tensor,
+        emb: Optional[Dict[str, Any]],
+        *,
+        mlp: bool,
+    ) -> torch.Tensor:
+        use_indexed = (
+            self.use_indexed_mlp_gammas
+            if mlp else self.use_indexed_att_gammas
+        )
+        if not use_indexed:
+            return gamma
+        indexed_dims = (
+            self.indexed_dims_mlp_gamma_by_zoom[zoom]
+            if mlp else self.indexed_dims_att_gamma_by_zoom[zoom]
+        )
+        return broadcast_indexed_tensor(
+            gamma, indexed_dims, reference, emb=emb
+        )
+
+    @staticmethod
+    def _validate_ext_update_shape(
+        update: torch.Tensor,
+        base: torch.Tensor,
+        zoom: int,
+        branch: str,
+    ) -> None:
+        if update.shape != base.shape:
+            raise ValueError(
+                f"{branch} update for zoom {zoom} has shape {tuple(update.shape)}, "
+                f"expected {tuple(base.shape)}"
+            )
+
+    def _apply_ext_update(
+        self,
+        base: torch.Tensor,
+        projected: torch.Tensor,
+        gamma: torch.Tensor,
+        gamma_res: torch.Tensor,
+        zoom: int,
+        branch: str,
+    ) -> torch.Tensor:
+        if self.scale_shift:
+            scale, shift = projected.chunk(2, dim=-1)
+            self._validate_ext_update_shape(scale, base, zoom, branch)
+            self._validate_ext_update_shape(shift, base, zoom, branch)
+            return base * (1 + gamma_res * scale) + gamma * shift
+        self._validate_ext_update_shape(projected, base, zoom, branch)
+        return (1 + gamma_res) * base + gamma * projected
+
+    @staticmethod
+    def _detokenize_ext(tokens: torch.Tensor) -> torch.Tensor:
+        return rearrange(
+            tokens,
+            "b v T N D t n d f -> b v (T t) (N n) (D d) f",
+        )
+
+    def create_QKV(
+        self,
+        x_zooms: Dict[int, torch.Tensor],
+        emb: Optional[Dict[str, Any]] = None,
+        sample_configs: Dict[int, Dict[str, Any]] = {},
+        mask_zooms: Dict[int, torch.Tensor] = {},
+    ) -> Tuple[
+        Dict[int, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Dict[str, int],
+    ]:
+        qkv_projections: List[torch.Tensor] = []
+        mixed_projections: List[torch.Tensor] = []
+        preprocessed: Dict[int, torch.Tensor] = {}
+        for zoom in self.q_zooms:
+            key = str(zoom)
+            x = self._preprocess_ext_zoom(
+                zoom,
+                x_zooms,
+                emb,
+                sample_configs,
+                mlp=False,
+            )
+            preprocessed[zoom] = x
+            qkv_projections.append(
+                self.qkv_projection_layers[key](
+                    x, emb=emb, sample_configs=sample_configs
+                )
+            )
+            if self.att_dim_mixed > 0:
+                mixed = rearrange(
+                    x,
+                    "b v T N D t n d f -> b 1 T N D t n d (v f)",
+                )
+                mixed_projections.append(
+                    self.qkv_projection_layers_mixed[key](
+                        mixed, emb=emb, sample_configs=sample_configs
+                    )
+                )
+
+        qkv = self._sum_ext_projections(qkv_projections, "QKV")
+        q, k, v = qkv.chunk(3, dim=-1)
+        if mixed_projections:
+            mixed_qkv = self._sum_ext_projections(
+                mixed_projections, "mixed QKV"
+            )
+            q_mixed, k_mixed, v_mixed = mixed_qkv.chunk(3, dim=-1)
+            expand_shape = (-1, q.shape[1], *([-1] * 7))
+            q = torch.cat((q, q_mixed.expand(*expand_shape)), dim=-1)
+            k = torch.cat((k, k_mixed.expand(*expand_shape)), dim=-1)
+            v = torch.cat((v, v_mixed.expand(*expand_shape)), dim=-1)
+
+        mask = mask_zooms.get(self.grid_layer_field.zoom)
+        q, k, v, mask, shape = self._pack_ext_qkv(
+            q, k, v, mask, sample_configs
+        )
+        return preprocessed, q, k, v, mask, shape
+
+    def forward_mlp(
+        self,
+        x_zooms: Dict[int, torch.Tensor],
+        x_base: Dict[int, torch.Tensor],
+        att_out: torch.Tensor,
+        shape: Dict[str, int],
+        emb: Optional[Dict[str, Any]] = None,
+        sample_configs: Dict[int, Dict[str, Any]] = {},
+    ) -> Dict[int, torch.Tensor]:
+        del x_base
+        att_tokens = rearrange(att_out, self.att_pattern_reverse, **shape)
+        original_tokens: Dict[int, torch.Tensor] = {}
+        post_attention_tokens: Dict[int, torch.Tensor] = {}
+
+        for zoom in self.target_zooms:
+            key = str(zoom)
+            base = self.update_tokenizers[key](
+                {zoom: x_zooms[zoom]}, sample_configs
+            )
+            original_tokens[zoom] = base
+            projected = self.dropout_att(
+                self.out_layers_att[key](
+                    att_tokens, emb=emb, sample_configs=sample_configs
+                )
+            )
+            gamma = self._ext_gamma(
+                self.att_gammas[key], zoom, base, emb, mlp=False
+            )
+            gamma_res = self._ext_gamma(
+                self.att_res_gammas[key], zoom, base, emb, mlp=False
+            )
+            updated = self._apply_ext_update(
+                base,
+                projected,
+                gamma,
+                gamma_res,
+                zoom,
+                "attention",
+            )
+            post_attention_tokens[zoom] = updated
+            x_zooms[zoom] = self._detokenize_ext(updated)
+
+        mlp_projections: List[torch.Tensor] = []
+        for zoom in self.target_zooms:
+            key = str(zoom)
+            preprocessed = self._preprocess_ext_zoom(
+                zoom,
+                x_zooms,
+                emb,
+                sample_configs,
+                mlp=True,
+            )
+            mlp_projections.append(
+                self.mlp_projection_layers[key](
+                    preprocessed,
+                    emb=emb,
+                    sample_configs=sample_configs,
+                )
+            )
+
+        mlp_tokens = self._sum_ext_projections(
+            mlp_projections, "MLP"
+        )
+        mlp_tokens = self.mlp_layer1(
+            mlp_tokens, emb=emb, sample_configs=sample_configs
+        )
+        mlp_tokens = self.mlp_activation(mlp_tokens)
+        mlp_tokens = self.dropout_mlp(mlp_tokens)
+        mlp_tokens = self.mlp_layer2(
+            mlp_tokens, emb=emb, sample_configs=sample_configs
+        )
+
+        for zoom in self.target_zooms:
+            key = str(zoom)
+            projected = self.dropout_mlp(
+                self.out_layers_mlp[key](
+                    mlp_tokens, emb=emb, sample_configs=sample_configs
+                )
+            )
+            residual = (
+                post_attention_tokens[zoom]
+                if self.mlp_residual_from_attention
+                else original_tokens[zoom]
+            )
+            gamma = self._ext_gamma(
+                self.mlp_gammas[key], zoom, residual, emb, mlp=True
+            )
+            gamma_res = self._ext_gamma(
+                self.mlp_res_gammas[key], zoom, residual, emb, mlp=True
+            )
+            updated = self._apply_ext_update(
+                residual,
+                projected,
+                gamma,
+                gamma_res,
+                zoom,
+                "MLP",
+            )
+            x_zooms[zoom] = self._detokenize_ext(updated)
+
+        return x_zooms
+
+    def forward(
+        self,
+        x_zooms: Dict[int, torch.Tensor] = {},
+        mask_zooms: Dict[int, torch.Tensor] = {},
+        emb: Optional[Dict[str, Any]] = None,
+        sample_configs: Dict[int, Dict[str, Any]] = {},
+    ) -> Dict[int, torch.Tensor]:
+        x_base, q, k, v, mask, shape = self.create_QKV(
+            x_zooms,
+            emb=emb,
+            sample_configs=sample_configs,
+            mask_zooms=mask_zooms,
+        )
+        att_out = safe_scaled_dot_product_attention(q, k, v, mask=mask)
         return self.forward_mlp(
             x_zooms,
             x_base,

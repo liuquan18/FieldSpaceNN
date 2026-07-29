@@ -37,12 +37,34 @@ def _merge_patch_dimension(tensor: torch.Tensor, n_patches: int, var_axis: int) 
     raise ValueError(f"Unsupported variable axis `{var_axis}`. Expected 1 or 2.")
 
 
-def _group_and_variable_meta(data_dict: Mapping[str, Any]) -> Tuple[List[List[str]], List[str]]:
+def _group_and_variable_meta(data: Any) -> Tuple[List[List[str]], List[str]]:
     grouped_variables: List[List[str]] = []
-    for group_name, variables in data_dict["variables"].items():
-        if group_name == "embedding":
+    variable_groups = None
+
+    if hasattr(data, "variables_target_groups") and getattr(data, "variables_target_groups") is not None:
+        variable_groups = getattr(data, "variables_target_groups")
+    elif hasattr(data, "data_dict"):
+        data_dict = getattr(data, "data_dict")
+        if isinstance(data_dict, Mapping) and "variables" in data_dict:
+            variable_groups = data_dict["variables"]
+    elif isinstance(data, Mapping) and "variables" in data:
+        variable_groups = data["variables"]
+
+    if variable_groups is None:
+        raise ValueError(
+            "Unable to resolve variable groups for predictions. "
+            "Expected one of: dataset.variables_target_groups, dataset.data_dict['variables'], "
+            "or data_dict['variables']."
+        )
+
+    for group_name, variables in variable_groups.items():
+        if group_name in ("embedding", "embedding_1D"):
             continue
-        grouped_variables.append(list(variables))
+
+        if isinstance(variables, str):
+            grouped_variables.append([variables])
+        else:
+            grouped_variables.append(list(variables))
 
     flat_variables: List[str] = [var for variables in grouped_variables for var in variables]
     duplicates = sorted([v for v in set(flat_variables) if flat_variables.count(v) > 1])
@@ -199,7 +221,7 @@ def test(cfg: DictConfig) -> None:
         npix = hp.nside2npix(2 ** max_zoom)
         n_patches = npix // 4 ** (max_zoom - sampling)
 
-    grouped_variables, variables_flat = _group_and_variable_meta(test_dataset.data_dict)
+    grouped_variables, variables_flat = _group_and_variable_meta(test_dataset)
     output_keys = list(variables_flat)
     expected_group_sizes = [len(v) for v in grouped_variables]
 
@@ -255,8 +277,6 @@ def test(cfg: DictConfig) -> None:
         output[:, var_idx] = test_dataset.var_normalizers[normalizer_zoom][var_name].denormalize(output[:, var_idx])
 
     output_dict = dict(zip(output_keys, output.split(1, dim=1)))
-    print(output_dict["tas"].shape)
-    print(output_dict["uas"][0])
     torch.save(output_dict, cfg.output_path)
 
 

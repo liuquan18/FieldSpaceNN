@@ -4,47 +4,36 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 from pytorch_lightning.utilities import rank_zero_only
 
-from .mg_diffusion_model import MGDiffusionModel
+from .mg_flowmatching_model import MGFlowMatchingModel
 from ..mg_transformer.pl_mg_model import LightningMGModel
 from ..mg_transformer.pl_mg_probabilistic import LightningProbabilisticModel
-from ...modules.diffusion.mg_gaussian_diffusion import MGGaussianDiffusion
-from ...modules.diffusion.mg_sampler import DDIMSampler, DDPMSampler
+from ...modules.flowmatching.mg_flow_matching import MGFlowMatching
+from ...modules.flowmatching.mg_sampler import EulerFlowSampler
 from ...modules.grids.grid_utils import decode_zooms
 from ...utils.helpers import merge_sampling_dicts
 
 
-class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
+class LightningMGFlowMatchingModel(LightningMGModel, LightningProbabilisticModel):
     """
-    Lightning wrapper for sequential multi-block diffusion training and inference.
+    Lightning wrapper for sequential multi-block flow-matching training and inference.
     """
 
     def __init__(
         self,
-        model: MGDiffusionModel,
-        gaussian_diffusion: MGGaussianDiffusion,
+        model: MGFlowMatchingModel,
+        flow_matching: MGFlowMatching,
         lr_groups: Mapping[str, Mapping[str, Any]],
         lambda_loss_dict: Mapping[str, Any],
         weight_decay: float = 0.0,
-        sampler: str = "ddpm",
+        sampler: str = "euler",
         n_samples: int = 1,
         max_batchsize: int = -1,
         decode_zooms: bool = True,
+        sampling_steps_per_block: int = 50,
         block_loss_weights: Optional[Sequence[float]] = None,
     ) -> None:
         """
-        Initialize the multi-block diffusion Lightning wrapper.
-
-        :param model: Sequential diffusion model containing MG_Transformer blocks.
-        :param gaussian_diffusion: Diffusion process helper.
-        :param lr_groups: Optimizer parameter-group configuration.
-        :param lambda_loss_dict: Loss weighting dictionary.
-        :param weight_decay: Weight decay applied in the optimizer.
-        :param sampler: Sampler name ("ddpm" or "ddim").
-        :param n_samples: Number of posterior samples for probabilistic inference.
-        :param max_batchsize: Optional cap on expanded prediction batch size.
-        :param decode_zooms: Whether to decode prediction outputs to a single zoom.
-        :param block_loss_weights: Optional per-block weights for all-block loss aggregation.
-        :return: None.
+        Initialize the multi-block flow-matching Lightning wrapper.
         """
         super().__init__(
             model=model,
@@ -53,15 +42,17 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
             weight_decay=weight_decay,
         )
 
-        self.gaussian_diffusion: MGGaussianDiffusion = gaussian_diffusion
-        if sampler == "ddpm":
-            self.sampler: DDPMSampler | DDIMSampler = DDPMSampler(self.gaussian_diffusion)
-        else:
-            self.sampler = DDIMSampler(self.gaussian_diffusion)
+        self.flow_matching: MGFlowMatching = flow_matching
+        if sampler != "euler":
+            raise ValueError(f"`sampler` must be 'euler', got `{sampler}`.")
+        self.sampler: EulerFlowSampler = EulerFlowSampler(self.flow_matching)
 
         self.n_samples: int = int(n_samples)
         self.max_batchsize: int = int(max_batchsize)
         self.decode_zooms: bool = bool(decode_zooms)
+        self.sampling_steps_per_block: int = int(sampling_steps_per_block)
+        if self.sampling_steps_per_block <= 0:
+            raise ValueError("`sampling_steps_per_block` must be > 0.")
 
         if block_loss_weights is None:
             self.block_loss_weights: List[float] = [1.0 / float(self.model.n_blocks)] * self.model.n_blocks
@@ -73,8 +64,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
                 )
             self.block_loss_weights = [float(weight) for weight in block_loss_weights]
 
-        self.model.validate_against_diffusion_steps(self.gaussian_diffusion.diffusion_steps)
-
     def forward(
         self,
         x_zooms_groups: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]] = None,
@@ -85,15 +74,7 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         return_all: bool = False,
     ):
         """
-        Forward call into the sequential diffusion model.
-
-        :param x_zooms_groups: Input zoom-group mappings.
-        :param sample_configs: Sampling configuration dictionary per zoom.
-        :param mask_zooms_groups: Optional mask groups aligned with inputs.
-        :param emb_groups: Optional embedding groups aligned with inputs.
-        :param out_zoom: Optional target zoom level for decode.
-        :param return_all: Whether to return all intermediate block outputs.
-        :return: Final model outputs, or all intermediate outputs.
+        Forward call into the sequential flow-matching model.
         """
         return self.model(
             x_zooms_groups=x_zooms_groups,
@@ -108,36 +89,18 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
     def _copy_groups(
         groups: Sequence[Optional[Dict[int, torch.Tensor]]],
     ) -> List[Optional[Dict[int, torch.Tensor]]]:
-        """
-        Create a shallow copy of grouped zoom dictionaries.
-
-        :param groups: Grouped zoom mappings.
-        :return: Copied list of grouped zoom mappings.
-        """
         return [group.copy() if group else None for group in groups]
 
     @staticmethod
     def _get_first_valid_group(
         groups: Sequence[Optional[Dict[int, torch.Tensor]]],
     ) -> Optional[Dict[int, torch.Tensor]]:
-        """
-        Return the first non-empty group from a list.
-
-        :param groups: Grouped zoom mappings.
-        :return: First valid group or None.
-        """
         return next((group for group in groups if group), None)
 
     def _get_batch_size_and_device(
         self,
         groups: Sequence[Optional[Dict[int, torch.Tensor]]],
     ) -> Tuple[int, torch.device]:
-        """
-        Infer batch size and device from grouped zoom tensors.
-
-        :param groups: Grouped zoom mappings.
-        :return: Tuple of (batch_size, device).
-        """
         first_valid_group = self._get_first_valid_group(groups)
         if not first_valid_group:
             return 0, self.device
@@ -146,63 +109,43 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         return int(tensor.shape[0]), tensor.device
 
     def _get_sample_configs(self, stage: str) -> Mapping[int, Any]:
-        """
-        Fetch dataset sampling configuration by stage.
-
-        :param stage: "train", "val", or "predict".
-        :return: Sampling configuration dictionary.
-        """
         if stage == "predict":
             dataset = self.trainer.predict_dataloaders.dataset
         else:
             dataset = self.trainer.val_dataloaders.dataset
         return dataset.sampling_zooms_collate or dataset.sampling_zooms
 
-    def _sample_block_diffusion_steps(
+    def _sample_block_flow_times(
         self,
         block_idx: int,
         batch_size: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Uniformly sample diffusion steps within a block-specific range.
-
-        :param block_idx: Block index.
-        :param batch_size: Batch size.
-        :param device: Device for sampled indices.
-        :return: Timestep tensor of shape ``(batch_size,)``.
-        """
-        start, end = self.model.get_step_range(block_idx, inference=False)
-        return torch.randint(start, end + 1, size=(batch_size,), device=device, dtype=torch.long)
+        time_range = self.model.get_time_range(block_idx, inference=False)
+        return self.flow_matching.sample_times(batch_size, device, time_range=time_range)
 
     @staticmethod
     def _extract_training_losses(
-        diffusion_outputs: Sequence[Tuple[Any, Any, Any]],
+        flow_outputs: Sequence[Tuple[Any, Any, Any]],
     ) -> Tuple[List[Optional[Dict[int, torch.Tensor]]], List[Optional[Dict[int, torch.Tensor]]], List[Optional[Dict[int, torch.Tensor]]]]:
-        """
-        Split diffusion output tuples into target, prediction, and pred_xstart groups.
-
-        :param diffusion_outputs: Output from ``MGGaussianDiffusion.training_losses``.
-        :return: Tuple of (targets, predictions, pred_xstart).
-        """
         target_groups: List[Optional[Dict[int, torch.Tensor]]] = []
         output_groups: List[Optional[Dict[int, torch.Tensor]]] = []
-        pred_xstart_groups: List[Optional[Dict[int, torch.Tensor]]] = []
+        pred_x1_groups: List[Optional[Dict[int, torch.Tensor]]] = []
 
-        for group_output in diffusion_outputs:
+        for group_output in flow_outputs:
             if group_output is None or len(group_output) < 2:
                 target_groups.append(None)
                 output_groups.append(None)
-                pred_xstart_groups.append(None)
+                pred_x1_groups.append(None)
                 continue
 
             target_groups.append(group_output[0])
             output_groups.append(group_output[1])
-            pred_xstart_groups.append(group_output[2] if len(group_output) > 2 else None)
+            pred_x1_groups.append(group_output[2] if len(group_output) > 2 else None)
 
-        return target_groups, output_groups, pred_xstart_groups
+        return target_groups, output_groups, pred_x1_groups
 
-    def _compute_losses_from_diffusion_outputs(
+    def _compute_losses_from_flow_outputs(
         self,
         source_groups: Sequence[Optional[Dict[int, torch.Tensor]]],
         output_groups: Sequence[Optional[Dict[int, torch.Tensor]]],
@@ -212,18 +155,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         emb_groups: Optional[Sequence[Optional[Dict[str, Any]]]],
         prefix: str,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute supervised losses from diffusion targets and outputs.
-
-        :param source_groups: Source group inputs used for weighting.
-        :param output_groups: Model output groups.
-        :param target_groups: Target groups from diffusion objective.
-        :param sample_configs: Sampling configuration dictionary per zoom.
-        :param mask_groups: Optional mask groups.
-        :param emb_groups: Optional embedding groups.
-        :param prefix: Prefix used in logged loss names.
-        :return: Tuple of (total_loss, loss_dict).
-        """
         mask_groups = list(mask_groups) if mask_groups is not None else [None] * len(source_groups)
         emb_groups = list(emb_groups) if emb_groups is not None else [None] * len(source_groups)
 
@@ -324,34 +255,23 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         emb_groups: Sequence[Optional[Dict[str, Any]]],
         prefix: str,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Run one block's diffusion objective and compute its supervised loss.
-
-        :param block_idx: Block index.
-        :param input_groups: Input groups for this block.
-        :param sample_configs: Sampling configuration dictionary per zoom.
-        :param mask_groups: Mask groups aligned with input groups.
-        :param emb_groups: Embedding groups aligned with input groups.
-        :param prefix: Prefix used for block-specific loss logging.
-        :return: Tuple of (block_loss, block_loss_dict).
-        """
         batch_size, device = self._get_batch_size_and_device(input_groups)
         if batch_size == 0:
             return torch.tensor(0.0, device=self.device), {}
 
-        diffusion_steps = self._sample_block_diffusion_steps(block_idx, batch_size, device)
-        diffusion_outputs = self.gaussian_diffusion.training_losses(
+        flow_times = self._sample_block_flow_times(block_idx, batch_size, device)
+        flow_outputs = self.flow_matching.training_losses(
             self.model.get_block(block_idx),
             input_groups,
-            diffusion_steps,
+            flow_times,
             mask_groups=mask_groups,
             emb_groups=emb_groups,
-            create_pred_xstart=False,
+            create_pred_x1=False,
             sample_configs=sample_configs,
         )
 
-        target_groups, output_groups, _ = self._extract_training_losses(diffusion_outputs)
-        block_loss, block_loss_dict = self._compute_losses_from_diffusion_outputs(
+        target_groups, output_groups, _ = self._extract_training_losses(flow_outputs)
+        block_loss, block_loss_dict = self._compute_losses_from_flow_outputs(
             source_groups=input_groups,
             output_groups=output_groups,
             target_groups=target_groups,
@@ -363,12 +283,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         return block_loss, block_loss_dict
 
     def _aggregate_block_losses(self, block_losses: Sequence[torch.Tensor]) -> torch.Tensor:
-        """
-        Aggregate per-block losses across all blocks.
-
-        :param block_losses: Ordered list of block losses.
-        :return: Aggregated total loss.
-        """
         if len(block_losses) == 0:
             return torch.tensor(0.0, device=self.device)
 
@@ -384,13 +298,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         batch: Tuple[Any, Any, Any, Any, Dict[int, torch.Tensor]],
         batch_idx: int,
     ) -> torch.Tensor:
-        """
-        Run one training step over all timestep-specialized blocks.
-
-        :param batch: Tuple ``(source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms)``.
-        :param batch_idx: Index of the current batch.
-        :return: Training loss tensor.
-        """
         sample_configs = self._get_sample_configs(stage="train")
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)
@@ -424,13 +331,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         batch: Tuple[Any, Any, Any, Any, Dict[int, torch.Tensor]],
         batch_idx: int,
     ) -> torch.Tensor:
-        """
-        Run one validation step over all timestep-specialized blocks.
-
-        :param batch: Tuple ``(source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms)``.
-        :param batch_idx: Index of the current batch.
-        :return: Validation loss tensor.
-        """
         sample_configs = self._get_sample_configs(stage="val")
         source_groups, target_groups, mask_groups, emb_groups, patch_index_zooms = batch
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)
@@ -470,20 +370,36 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
 
     @staticmethod
     def _slice_batch_item(value: Any, index: int = 0) -> Any:
-        """
-        Slice the first batch element from nested tensor/dict structures.
-
-        :param value: Nested value that may contain tensors and dicts.
-        :param index: Batch index to slice.
-        :return: Sliced nested value.
-        """
         if isinstance(value, torch.Tensor):
             if value.ndim > 0:
                 return value[index:index + 1]
             return value
         if isinstance(value, dict):
-            return {k: LightningMGDiffusionModel._slice_batch_item(v, index=index) for k, v in value.items()}
+            return {k: LightningMGFlowMatchingModel._slice_batch_item(v, index=index) for k, v in value.items()}
         return value
+
+    def _select_block_for_time(self, time_value: float, inference: bool = False) -> int:
+        """
+        Select the block responsible for a continuous time value.
+
+        If ranges do not fully cover ``time_value``, fall back to the nearest range center.
+        """
+        eps = 1e-8
+        best_idx = 0
+        best_distance = float("inf")
+
+        for block_idx in range(self.model.n_blocks):
+            start, end = self.model.get_time_range(block_idx, inference=inference)
+            if start - eps <= time_value <= end + eps:
+                return block_idx
+
+            center = 0.5 * (start + end)
+            distance = abs(time_value - center)
+            if distance < best_distance:
+                best_distance = distance
+                best_idx = block_idx
+
+        return best_idx
 
     def log_healpix_tensor_plot(
         self,
@@ -493,20 +409,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         emb_groups: Sequence[Optional[Dict[str, Any]]],
         patch_index_zooms: Dict[int, torch.Tensor],
     ) -> None:
-        """
-        Log diffusion denoising snapshots for selected timesteps on one validation sample.
-
-        This mirrors the single-block diffusion visualization flow and adapts it to
-        sequential multi-block denoising by chaining each block's ``pred_xstart`` into
-        the next block.
-
-        :param source_groups: Source zoom-group inputs.
-        :param target_groups: Target zoom-group inputs.
-        :param mask_groups: Mask groups aligned with inputs.
-        :param emb_groups: Embedding groups aligned with inputs.
-        :param patch_index_zooms: Patch indices per zoom.
-        :return: None.
-        """
         group_idx = next(
             (
                 idx
@@ -529,69 +431,70 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         max_zoom = max(max_zooms) if max_zooms else max(self.model.in_zooms)
 
         device = source_group[max(source_group.keys())].device
-        ts = torch.tensor(
-            [(self.gaussian_diffusion.diffusion_steps // 4) * (x + 1) - 1 for x in range(4)],
-            device=device,
+        ts = torch.tensor([0.25, 0.5, 0.75, 1.0], device=device)
+
+        source_p = {zoom: source_group[zoom][0:1] for zoom in source_group.keys()}
+        target_p = {zoom: target_group[zoom][0:1] for zoom in target_group.keys()}
+        mask_p = (
+            {zoom: mask_group[zoom][0:1] for zoom in mask_group.keys()}
+            if mask_group
+            else None
+        )
+        emb_p = self._slice_batch_item(emb_group, index=0) if emb_group else None
+
+        patch_index_zooms_p = {zoom: patch_index_zooms[zoom][0:1] for zoom in patch_index_zooms.keys()}
+        sample_configs_p = merge_sampling_dicts(
+            copy.deepcopy(self._get_sample_configs(stage="val")),
+            patch_index_zooms_p,
         )
 
+        target_groups_p: List[Optional[Dict[int, torch.Tensor]]] = [target_p.copy()]
+        mask_groups_p = [mask_p.copy()] if mask_p else [None]
+        emb_groups_p = [emb_p] if emb_p else [None]
+        noise_groups_p = [self.flow_matching.generate_noise(target_p)]
+        time_dtype = next(iter(target_p.values())).dtype
+
         for t in ts:
-            source_p = {zoom: source_group[zoom][0:1] for zoom in source_group.keys()}
-            target_p = {zoom: target_group[zoom][0:1] for zoom in target_group.keys()}
-            mask_p = (
-                {zoom: mask_group[zoom][0:1] for zoom in mask_group.keys()}
-                if mask_group
-                else None
+            time_value = float(t.item())
+            block_idx = self._select_block_for_time(time_value, inference=False)
+            time_tensor = torch.tensor([time_value], device=device, dtype=time_dtype)
+
+            pred_x1_outputs = self.flow_matching.training_losses(
+                self.model.get_block(block_idx),
+                target_groups_p,
+                time_tensor,
+                mask_groups=mask_groups_p,
+                emb_groups=emb_groups_p,
+                noise_groups=noise_groups_p,
+                create_pred_x1=True,
+                sample_configs=sample_configs_p,
             )
-            emb_p = self._slice_batch_item(emb_group, index=0) if emb_group else None
 
-            patch_index_zooms_p = {zoom: patch_index_zooms[zoom][0:1] for zoom in patch_index_zooms.keys()}
-            sample_configs_p = merge_sampling_dicts(
-                copy.deepcopy(self._get_sample_configs(stage="val")),
-                patch_index_zooms_p,
-            )
-
-            current_groups: List[Optional[Dict[int, torch.Tensor]]] = [target_p.copy()]
-            mask_groups_p = [mask_p.copy()] if mask_p else [None]
-            emb_groups_p = [emb_p] if emb_p else [None]
-
-            for block_idx in range(self.model.n_blocks):
-                pred_xstart_outputs = self.gaussian_diffusion.training_losses(
-                    self.model.get_block(block_idx),
-                    current_groups,
-                    torch.stack([t]),
-                    mask_groups=mask_groups_p,
-                    emb_groups=emb_groups_p,
-                    create_pred_xstart=True,
-                    sample_configs=sample_configs_p,
-                )
-
-                _, _, pred_xstart_groups = self._extract_training_losses(pred_xstart_outputs)
-                current_groups = self._copy_groups(pred_xstart_groups)
-
-            pred_xstart_group = current_groups[0] if current_groups else None
-            if not pred_xstart_group:
+            _, _, pred_x1_groups = self._extract_training_losses(pred_x1_outputs)
+            pred_x1_group = pred_x1_groups[0] if pred_x1_groups else None
+            if not pred_x1_group:
                 continue
 
             if self.decode_zooms:
-                pred_xstart_comp = decode_zooms(
-                    pred_xstart_group.copy(),
+                pred_x1_comp = decode_zooms(
+                    pred_x1_group.copy(),
                     sample_configs=sample_configs_p,
                     out_zoom=max_zoom,
                 )
             else:
-                pred_xstart_comp = {max_zoom: pred_xstart_group[max_zoom]}
+                pred_x1_comp = {max_zoom: pred_x1_group[max_zoom]}
 
             self.logger.log_healpix_tensor_plot(
                 source_p,
-                pred_xstart_group,
+                pred_x1_group,
                 target_p,
                 mask_p,
                 sample_configs_p,
                 emb_p,
                 max_zoom,
                 self.current_epoch,
-                output_comp=pred_xstart_comp,
-                plot_name=f"_{t.item()}",
+                output_comp=pred_x1_comp,
+                plot_name=f"_flow_{t.item():.2f}",
             )
 
     def predict_step(
@@ -599,13 +502,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         batch: Tuple[Any, Any, Any, Any, Dict[int, torch.Tensor]],
         batch_idx: int,
     ) -> Dict[str, Any]:
-        """
-        Run prediction using the probabilistic parent implementation.
-
-        :param batch: Prediction batch tuple.
-        :param batch_idx: Index of the current batch.
-        :return: Prediction output dictionary.
-        """
         return LightningProbabilisticModel.predict_step(self, batch, batch_idx)
 
     def _sample_block_range(
@@ -617,67 +513,24 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         sample_configs: Mapping[int, Dict[str, Any]],
         initialize_from_noise: bool = True,
     ) -> List[Optional[Dict[int, torch.Tensor]]]:
-        """
-        Run reverse diffusion for one block over its configured inference range.
-
-        :param block_idx: Block index.
-        :param input_groups: Conditioning groups for this block.
-        :param mask_groups: Optional masks aligned with inputs.
-        :param emb_groups: Embeddings aligned with inputs.
-        :param sample_configs: Sampling configuration dictionary per zoom.
-        :param initialize_from_noise: If True, initialize this block from Gaussian
-            noise. If False, start directly from ``input_groups``.
-        :return: Final sampled groups for this block.
-        """
         if initialize_from_noise:
             x_t_groups = [
-                self.gaussian_diffusion.generate_noise(group) if group else None
+                self.flow_matching.generate_noise(group) if group else None
                 for group in input_groups
             ]
         else:
             x_t_groups = self._copy_groups(input_groups)
 
-        first_valid_group = self._get_first_valid_group(x_t_groups)
-        if not first_valid_group:
-            return list(x_t_groups)
-
-        device = next(iter(first_valid_group.values())).device
-        batch_size = next(iter(first_valid_group.values())).shape[0]
-
-        for i, (mask_zooms, input_zooms, x_t_zooms) in enumerate(zip(mask_groups, input_groups, x_t_groups)):
-            if mask_zooms and input_zooms and x_t_zooms:
-                x_t_groups[i] = {
-                    int(zoom): torch.where(~mask_zooms[zoom], input_zooms[zoom], x_t_zooms[zoom])
-                    for zoom in x_t_zooms.keys()
-                }
-
-        start_step, end_step = self.model.get_step_range(block_idx, inference=True)
-        step_indices = range(end_step, start_step - 1, -1)
-
-        for step in step_indices:
-            diffusion_steps = torch.full((batch_size,), step, device=device, dtype=torch.long)
-            out = self.sampler.sample(
-                self.model.get_block(block_idx),
-                x_t_groups,
-                diffusion_steps,
-                mask_groups=mask_groups,
-                sample_configs=sample_configs,
-                emb_groups=emb_groups,
-            )
-
-            if mask_groups is not None:
-                for j, (mask_zooms, input_zooms, sample_zooms) in enumerate(
-                    zip(mask_groups, input_groups, out["sample"])
-                ):
-                    if mask_zooms and input_zooms and sample_zooms:
-                        out["sample"][j] = {
-                            int(zoom): torch.where(~mask_zooms[zoom], input_zooms[zoom], sample_zooms[zoom])
-                            for zoom in input_zooms.keys()
-                        }
-
-            x_t_groups = out["sample"]
-
-        return list(x_t_groups)
+        return self.sampler.sample_loop(
+            self.model.get_block(block_idx),
+            input_groups=input_groups,
+            x_t_groups=x_t_groups,
+            mask_groups=mask_groups,
+            emb_groups=emb_groups,
+            sample_configs=sample_configs,
+            time_range=self.model.get_time_range(block_idx, inference=True),
+            n_steps=self.sampling_steps_per_block,
+        )
 
     def _predict_step(
         self,
@@ -687,16 +540,6 @@ class LightningMGDiffusionModel(LightningMGModel, LightningProbabilisticModel):
         mask_groups: Sequence[Optional[Dict[int, torch.Tensor]]],
         emb_groups: Sequence[Optional[Dict[str, Any]]],
     ) -> List[Optional[Dict[int, torch.Tensor]]]:
-        """
-        Internal prediction step with sequential block-wise diffusion sampling.
-
-        :param source_groups: Source zoom-group inputs.
-        :param target_groups: Target zoom-group inputs.
-        :param patch_index_zooms: Patch indices per zoom.
-        :param mask_groups: Mask groups aligned with inputs.
-        :param emb_groups: Embedding groups aligned with inputs.
-        :return: Output zoom-group mappings.
-        """
         sample_configs = self._get_sample_configs(stage="predict")
         sample_configs = merge_sampling_dicts(sample_configs, patch_index_zooms)
 

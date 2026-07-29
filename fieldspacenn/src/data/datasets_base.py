@@ -474,6 +474,12 @@ class BaseDataset(Dataset):
             z: np.asarray(idx_map, dtype=np.int32) for z, idx_map in self.index_map.items()
         }
 
+        # One-dimensional forcings are time-dependent conditioning data. They are
+        # loaded directly and must not participate in spatial grid mappings.
+        self.forcing_variables: List[str] = list(
+            self.data_dict['variables'].get('embedding_1D', [])
+        )
+
         # Build variable group indices for embedding and masking.
         self.variables_by_group = normalized_variables_by_group
         self.data_dict['variables'] = self.variables_by_group
@@ -487,7 +493,9 @@ class BaseDataset(Dataset):
         self.embed_group_ids: Dict[str, int] = {}
         embed_group_id = 0
         for group_id, (group, vars) in enumerate(self.variables_by_group.items()):
-            all_variables += list(vars)
+            if group == 'embedding_1D':
+                continue
+            all_variables += vars
             self.group_ids[group] = (group_id)
             if group != 'embedding':
                 self.embed_group_ids[group] = embed_group_id
@@ -532,8 +540,10 @@ class BaseDataset(Dataset):
             norm_dict = json.load(json_file)
 
         self.var_normalizers: Dict[int, Dict[str, Any]] = {}
+        self.forcing_normalizers: Dict[int, Dict[str, Any]] = {}
         for zoom in self.zooms:
             self.var_normalizers[zoom] = {}
+            self.forcing_normalizers[zoom] = {}
             for var in all_variables:
                 if str(zoom) in norm_dict[var].keys():
                     # Zoom-specific stats override global stats when available.
@@ -548,6 +558,21 @@ class BaseDataset(Dataset):
                     self.var_normalizers[zoom][var] = normalizers.__getattribute__(norm_class)(
                         norm_dict[var]['stats'],
                         norm_dict[var]['normalizer'])
+
+            # Forcings may use the normalizer configuration, but raw physical
+            # values remain valid when no statistics have been provided.
+            for var in self.forcing_variables:
+                if var not in norm_dict:
+                    continue
+                if str(zoom) in norm_dict[var].keys():
+                    norm_definition = norm_dict[var][str(zoom)]
+                else:
+                    norm_definition = norm_dict[var]
+                norm_class = norm_definition['normalizer']['class']
+                assert norm_class in normalizers.__dict__.keys(), f'normalizer class {norm_class} not defined'
+                self.forcing_normalizers[zoom][var] = normalizers.__getattribute__(norm_class)(
+                    norm_definition['stats'],
+                    norm_definition['normalizer'])
         self.normalize_data: bool = normalize_data
         self.len_dataset: int = len(list(self.index_map.values())[0])
 
@@ -626,7 +651,7 @@ class BaseDataset(Dataset):
             patch_indices = self.get_indices_from_patch_idx(zoom, patch_idx)
 
             # Resolve indices either on the target grid (post-map) or the source grid (pre-map).
-            post_map = mapping_zoom > zoom
+            post_map = mapping_zoom > zoom or (patch_dim is None and mapping_zoom >= zoom)
             if post_map:
                 indices = mapping['indices'][..., [0]].reshape(-1, 4 ** (mapping_zoom - zoom))
                 if patch_dim:
@@ -670,8 +695,21 @@ class BaseDataset(Dataset):
         """
         # Fetch raw patch indices
         drop_mask_ = drop_mask.clone() if drop_mask is not None else None
-        if drop_mask_ is not None and drop_mask_.ndim == 2:
-            drop_mask_ = drop_mask_.unsqueeze(0)
+        if drop_mask_ is not None:
+            # Accept (t, n), (v, t, n), or (1, v, t, n), then normalize to (v, t, n).
+            if drop_mask_.ndim == 4:
+                if drop_mask_.shape[0] != 1:
+                    raise ValueError(
+                        f"Expected drop_mask leading batch dim to be 1, got shape {tuple(drop_mask_.shape)}"
+                    )
+                drop_mask_ = drop_mask_.squeeze(0)
+            if drop_mask_.ndim == 2:
+                drop_mask_ = drop_mask_.unsqueeze(0)
+            if drop_mask_.ndim != 3:
+                raise ValueError(
+                    f"Expected drop_mask to have 2, 3, or 4 dims, got shape {tuple(drop_mask_.shape)}"
+                )
+            drop_mask_ = drop_mask_.to(dtype=torch.bool)
 
         patch_dim_candidates = [d for d in ds.dims if "cell" in d or "ncells" in d]
         patch_dim = patch_dim_candidates[0] if patch_dim_candidates else None
@@ -690,7 +728,7 @@ class BaseDataset(Dataset):
             mask = get_mapping_weights(mapping)[..., 0].view(1, 1, -1, 1, 1)
 
             # Map indices differently depending on whether we are projecting from a higher zoom.
-            post_map = mapping_zoom > zoom
+            post_map = mapping_zoom > zoom or (patch_dim is None and mapping_zoom >= zoom)
             if post_map:
                 indices = mapping['indices'][..., [0]].reshape(-1, 4 ** (mapping_zoom - zoom))
 
@@ -699,14 +737,14 @@ class BaseDataset(Dataset):
                 mask = mask[:, :, patch_indices]
 
                 if drop_mask_ is not None:
-                    drop_mask_ = drop_mask_[:, :, patch_indices]
+                    drop_mask_ = drop_mask_[..., patch_indices]
 
             ds_variables = ds[variables]
             arr = ds_variables.to_array().to_numpy()
             if arr.dtype == np.float64:
                 arr = arr.astype(np.float32, copy=False)
-            data_g = torch.from_numpy(arr).unsqueeze(dim=-1)
-
+            # Normalize in raw array layout first.
+            data_g = torch.from_numpy(arr)
             if self.normalize_data:
                 for k, variable in enumerate(variables):
                     data_g[k] = self.var_normalizers[zoom][variable].normalize(data_g[k])
@@ -719,21 +757,36 @@ class BaseDataset(Dataset):
             data_g = data_g.transpose(2,3)
 
             if not patch_dim and post_map:
-                data_g = data_g.reshape(data_g.shape[0], data_g.shape[1], -1)[:, :, indices.view(-1)]
+                data_g = data_g[:, :, indices.view(-1), :, :]
 
-        if drop_mask_ is not None and mask.dtype!=torch.bool:
-            mask = (1-1.*drop_mask_.unsqueeze(dim=-1)) * mask
+        if drop_mask_ is not None and mask.dtype != torch.bool:
+            drop_mask_expanded = drop_mask_.unsqueeze(dim=-1).unsqueeze(dim=-1)
+            mask = (1 - drop_mask_expanded.to(mask.dtype)) * mask
             mask = mask.expand_as(data_g)
 
         elif drop_mask_ is not None:
-            mask = torch.logical_or(drop_mask, mask.expand_as(drop_mask))
+            mapping_mask = mask.expand_as(data_g)
+            drop_mask_expanded = drop_mask_.unsqueeze(dim=-1).unsqueeze(dim=-1).expand_as(mapping_mask)
+            mask = torch.logical_and(mapping_mask, torch.logical_not(drop_mask_expanded))
 
         else:
             mask = None
+
+        # Treat NaNs as masked values and zero them out before zoom transforms.
+        nan_mask = torch.isnan(data_g)
+        if nan_mask.any():
+            data_g = data_g.clone()
+            data_g[nan_mask] = 0
+
+            if mask is None:
+                mask = torch.logical_not(nan_mask)
+            elif mask.dtype == torch.bool:
+                mask = torch.logical_and(mask, torch.logical_not(nan_mask))
+            else:
+                mask = mask * torch.logical_not(nan_mask).to(mask.dtype)
         
         if mask is not None and not (mask == False).any():
             mask = mask.expand_as(data_g)
-
         data_g, mask = to_zoom(data_g, mapping_zoom, zoom, mask=mask, binarize_mask=self.output_binary_mask)
 
         if post_map:
@@ -807,6 +860,61 @@ class BaseDataset(Dataset):
                 f"coordinate has length {depth_values.numel()}."
             )
         return overwrite_depths
+
+    def get_forcing_data(
+        self,
+        ds: xr.Dataset,
+        time_indices: Sequence[int],
+        variables: Sequence[str],
+        zoom: int,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Load time-dependent one-dimensional forcing profiles.
+
+        :param ds: Input dataset containing the forcing variables.
+        :param time_indices: Exact time indices used by the corresponding field sample.
+        :param variables: Forcing variable names to load.
+        :param zoom: Zoom whose optional normalization statistics should be used.
+        :return: Mapping of forcing name to tensors shaped ``(b, t, n)``.
+        """
+        forcing_data: Dict[str, torch.Tensor] = {}
+        for variable in variables:
+            if variable not in ds:
+                raise KeyError(f"Forcing variable '{variable}' is missing from the source dataset.")
+
+            dims = ds[variable].dims
+            if 'time' not in dims:
+                raise ValueError(
+                    f"Forcing variable '{variable}' must contain a time dimension, got {dims}."
+                )
+
+            profile_dims = [dim for dim in dims if dim != 'time']
+            if len(profile_dims) != 1:
+                raise ValueError(
+                    f"Forcing variable '{variable}' must have exactly one non-time dimension, "
+                    f"got {dims}."
+                )
+
+            values = (
+                ds[variable]
+                .isel(time=time_indices)
+                .transpose('time', profile_dims[0])
+                .to_numpy()
+            )
+            if values.dtype == np.float64:
+                values = values.astype(np.float32, copy=False)
+
+            forcing = torch.from_numpy(values)
+            if self.normalize_data and variable in self.forcing_normalizers[zoom]:
+                forcing = self.forcing_normalizers[zoom][variable].normalize(forcing)
+            forcing = torch.nan_to_num(forcing)
+            forcing_data[variable] = rearrange(
+                forcing,
+                '(b t) n -> b t n',
+                b=self.load_n_samples_time,
+            )
+
+        return forcing_data
 
    #def get_masks_zooms(self, grid_type):
 
@@ -1043,7 +1151,10 @@ class BaseDataset(Dataset):
         running_var_offset = 0
         for group in group_keys:
             variables = self.variables_by_group[group]
-            sample_size = len(variables) if self.n_sample_variables == -1 else min(self.n_sample_variables, len(variables))
+            if group == 'embedding_1D':
+                sample_size = len(variables)
+            else:
+                sample_size = len(variables) if self.n_sample_variables == -1 else min(self.n_sample_variables, len(variables))
             var_indices[group] = np.arange(len(variables))
 
             if sample_size != len(variables):
@@ -1062,7 +1173,11 @@ class BaseDataset(Dataset):
         # Only build a global dropout mask when a single source ensures shared indexing.
         if self.single_source and hr_dopout:
             nt = 1 + self.max_time_step_future + self.max_time_step_past
-            total_vars = sum(len(selected_vars[group]) for group in selected_vars.keys())
+            total_vars = sum(
+                len(selected_vars[group])
+                for group in selected_vars.keys()
+                if group not in ('embedding', 'embedding_1D')
+            )
             drop_mask_input = self.get_mask(
                 total_vars,
                 nt,
@@ -1102,7 +1217,15 @@ class BaseDataset(Dataset):
                 target_file = self.data_dict['target'][zoom]['files'][int(file_index)]
 
             with xr.open_dataset(source_file) as ds:
-                mapping_zoom = get_zoom_from_npix(ds.cell.size)
+                if "cell" in ds.sizes:
+                    mapping_zoom = get_zoom_from_npix(ds.sizes["cell"])
+                elif "ncells" in ds.sizes:
+                    mapping_zoom = get_zoom_from_npix(ds.sizes["ncells"])
+                else:
+                    mapping_zoom = zoom if zoom in self.mapping else max(self.mapping.keys())
+
+                if mapping_zoom is None:
+                    mapping_zoom = zoom if zoom in self.mapping else max(self.mapping.keys())
 
             if not loaded:
                 ds_source, ds_target = self.get_files(source_file, file_path_target=target_file, drop_source=self.p_dropout>0)
@@ -1195,6 +1318,17 @@ class BaseDataset(Dataset):
             for group_idx, group in enumerate(group_keys):
                 if zoom not in self.group_zooms[group]:
                     continue
+      
+                if group == 'embedding_1D':
+                    source_zooms_groups[group_idx][zoom] = self.get_forcing_data(
+                        ds_source,
+                        time_indices,
+                        selected_vars[group],
+                        zoom,
+                    )
+                    target_zooms_groups[group_idx][zoom] = None
+                    mask_mapping_zooms_groups[group_idx][zoom] = None
+                    continue
 
                 group_source_zoom = ds_emb_zoom if group == 'embedding' else ds_source_zoom
                 data_source, drop_mask_zoom_group, depth_values = self.get_data(
@@ -1239,6 +1373,7 @@ class BaseDataset(Dataset):
 
         emb = {}
         StaticVariableEmbedder = None
+        ForcingEmbedder = None
         # emb['DensityEmbedder'] = torch.tensor([selected_var_ids[group] for group in group_keys])
         for group_idx, group in enumerate(group_keys):
             if group == 'embedding': 
@@ -1246,9 +1381,11 @@ class BaseDataset(Dataset):
                 StaticVariableEmbedder = source_zooms_groups[group_idx]
                 StaticVariableEmbedder = dict(zip(StaticVariableEmbedder.keys(), 
                                                   [rearrange(t, 'v (b t) n f d-> b t n (v f d)', b=self.load_n_samples_time) for t in StaticVariableEmbedder.values()]))
+            elif group == 'embedding_1D':
+                ForcingEmbedder = source_zooms_groups[group_idx]
 
         for group_idx, group in enumerate(group_keys):
-            if group != 'embedding': 
+            if group not in ('embedding', 'embedding_1D'):
                 source_zooms, target_zooms, sample_configs_source, sample_configs_target, mask_group = self._finalize_group(
                     source_zooms_groups[group_idx],
                     target_zooms_groups[group_idx],
@@ -1283,6 +1420,9 @@ class BaseDataset(Dataset):
 
                 if StaticVariableEmbedder is not None:
                     emb_group['StaticVariableEmbedder'] = StaticVariableEmbedder
+
+                if ForcingEmbedder is not None:
+                    emb_group['ForcingEmbedder'] = ForcingEmbedder
 
                     
                 emb_group['TimeEmbedder'] = {
@@ -1326,7 +1466,8 @@ class BaseDataset(Dataset):
                     'TimeProgressEmbedder': emb_groups[0]['TimeProgressEmbedder'],
                     'PressureLevelEmbedder': emb_groups[0]['PressureLevelEmbedder'],
                     'TimeIndexEmbedder': emb_groups[0]['TimeIndexEmbedder'],
-                    'VariableEmbedder': torch.zeros(source_zooms_groups_out_[reference_zoom].shape[-1], dtype=torch.long)}
+                    'VariableEmbedder': torch.zeros(source_zooms_groups_out_[reference_zoom].shape[-1], dtype=torch.long),
+                    'ForcingEmbedder': emb_groups[0]['ForcingEmbedder']}
 
             emb_groups = [emb]
             source_zooms_groups_out = [source_zooms_groups_out_]

@@ -8,6 +8,9 @@ import torch
 from ..src.utils.helpers import load_pretrained_checkpoints, freeze_zoom_levels
 from ..src.data.pl_data_module import DataModule
 
+import logging
+logging.getLogger("fsspec.reference").setLevel(logging.WARNING)
+
 torch.manual_seed(42)
 
 

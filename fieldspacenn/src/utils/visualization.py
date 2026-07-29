@@ -35,7 +35,12 @@ def healpix_plot_local(
     :return: None.
     """
     # Select pixel indices for the requested patch.
-    ipix = np.arange(hp.nside2npix(2**zoom)).reshape(-1,4**(zoom-zoom_patch_sample))[patch_index[0]]
+    if isinstance(patch_index, (list, tuple, np.ndarray, torch.Tensor)):
+        patch_idx = int(patch_index[0])
+    else:
+        patch_idx = int(patch_index)
+
+    ipix = np.arange(hp.nside2npix(2**zoom)).reshape(-1,4**(zoom-zoom_patch_sample))[patch_idx]
     lon, lat = hp.pix2ang(2**zoom, ipix, nest=True, lonlat=True)
 
     n_p = max(100, int(np.sqrt(len(lon))))
@@ -260,35 +265,92 @@ def healpix_plot_zooms_var(input_zooms: Dict[int, torch.Tensor],
     :param plot_n_ts: Number of timesteps to plot.
     :return: List of saved file paths.
     """
+    def _is_plot_tensor(x: Any) -> bool:
+        return torch.is_tensor(x) and x.ndim >= 6
 
-    zoom_levels = sorted(output_zooms.keys())
+    if output_zooms is None or gt_zooms is None:
+        return []
+
+    zoom_levels_input = sorted(
+        [zoom for zoom, tensor in input_zooms.items() if _is_plot_tensor(tensor)]
+    )
+    zoom_levels_output_gt = sorted(
+        [
+            zoom
+            for zoom in (set(output_zooms.keys()) & set(gt_zooms.keys()))
+            if _is_plot_tensor(output_zooms.get(zoom)) and _is_plot_tensor(gt_zooms.get(zoom))
+        ]
+    )
+    if len(zoom_levels_output_gt) == 0:
+        return []
+
     save_paths = []
 
     B, V, T, _, _, _ = gt_zooms[zoom_levels[-1]].shape
     plot_ts = (T-1) - np.arange(plot_n_ts)
 
+    if max_vars <= 0 or max_ts <= 0:
+        return []
+
+    if plot_n_vars == -1:
+        n_plot_vars = max_vars
+    else:
+        n_plot_vars = min(plot_n_vars, max_vars)
+
+    n_plot_ts = min(plot_n_ts, max_ts)
+    plot_ts = (max_ts - 1) - np.arange(n_plot_ts)
+
     for ts in plot_ts:
-        # Assume all zoom levels have same number of variables
-        B, V, T, _, _, _ = input_zooms[zoom_levels[0]].shape
-
-        if plot_n_vars==-1:
-            plot_n_vars=V
-
-        for var in range(plot_n_vars):
+        for var in range(n_plot_vars):
             input_maps = {}
             output_maps = {}
             gt_maps = {}
             mask_maps = {}
 
-            for zoom in zoom_levels:
-                input_maps[zoom] = input_zooms[zoom][sample, var, ts, :, 0, 0].float().cpu().numpy()
-                output_maps[zoom] = output_zooms[zoom][sample, var, ts, :, 0, 0].float().cpu().numpy()
-                gt_maps[zoom] = gt_zooms[zoom][sample, var, ts, :, 0, 0].float().cpu().numpy()
-                mask_maps[zoom] = mask_zooms[zoom][sample, var, ts, :, 0, 0].float().cpu().numpy() if mask_zooms is not None else None
+            for zoom in zoom_levels_input:
+                input_zoom = input_zooms[zoom]
+                if var < input_zoom.shape[1]:
+                    sample_in = min(sample, input_zoom.shape[0] - 1)
+                    var_in = var
+                    ts_in = min(int(ts), input_zoom.shape[2] - 1)
+                    input_maps[zoom] = input_zoom[sample_in, var_in, ts_in, :, 0, 0].float().cpu().numpy()
+
+            for zoom in zoom_levels_output_gt:
+                output_zoom = output_zooms[zoom]
+                gt_zoom = gt_zooms[zoom]
+                if var >= output_zoom.shape[1] or var >= gt_zoom.shape[1]:
+                    continue
+
+                sample_out = min(sample, output_zoom.shape[0] - 1)
+                sample_gt = min(sample, gt_zoom.shape[0] - 1)
+                var_out = var
+                var_gt = var
+                ts_out = min(int(ts), output_zoom.shape[2] - 1)
+                ts_gt = min(int(ts), gt_zoom.shape[2] - 1)
+
+                output_maps[zoom] = output_zoom[sample_out, var_out, ts_out, :, 0, 0].float().cpu().numpy()
+                gt_maps[zoom] = gt_zoom[sample_gt, var_gt, ts_gt, :, 0, 0].float().cpu().numpy()
+
+                if mask_zooms is not None and zoom in mask_zooms and _is_plot_tensor(mask_zooms.get(zoom)):
+                    mask_zoom = mask_zooms[zoom]
+                    sample_mask = min(sample, mask_zoom.shape[0] - 1)
+                    if var < mask_zoom.shape[1]:
+                        var_mask = var
+                        ts_mask = min(int(ts), mask_zoom.shape[2] - 1)
+                        mask_maps[zoom] = mask_zoom[sample_mask, var_mask, ts_mask, :, 0, 0].float().cpu().numpy()
 
             # Use embedding index for variable name if available
             if emb is not None and 'VariableEmbedder' in emb:
-                var_idx = emb['VariableEmbedder'][sample, var].item()
+                var_embedder = emb['VariableEmbedder']
+                if (
+                    torch.is_tensor(var_embedder)
+                    and var_embedder.ndim >= 2
+                    and sample < var_embedder.shape[0]
+                    and var < var_embedder.shape[1]
+                ):
+                    var_idx = var_embedder[sample, var].item()
+                else:
+                    var_idx = var
             else:
                 var_idx = var
 

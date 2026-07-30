@@ -68,3 +68,4 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry.scripts]
 fieldspacenn-train = "fieldspacenn.src.train:train"
 fieldspacenn-test-healpix = "fieldspacenn.src.test_healpix:test"
+fieldspacenn-rollout = "fieldspacenn.src.rollout:rollout"

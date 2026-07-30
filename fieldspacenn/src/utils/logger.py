@@ -275,11 +275,19 @@ class CustomImageLogger(Logger):
                 plot_name=f"epoch_{current_epoch}{plot_name}",
             )
 
-        # Build combined plots at the maximum zoom for easier visual comparison.
-        source_p = decode_zooms(input_data, sample_configs=sample_configs, out_zoom=max_zoom)
-        target_p = decode_zooms(gt, sample_configs=sample_configs, out_zoom=max_zoom)
+        # Build one combined plot by decoding each tensor dict to a shared zoom.
+        combined_zoom_candidates = []
+        for zoom_dict in (input_data, output, gt):
+            if zoom_dict:
+                combined_zoom_candidates.extend([int(z) for z in zoom_dict.keys()])
+        combined_zoom = max(combined_zoom_candidates) if combined_zoom_candidates else max_zoom
 
-        output_p = output_comp
+        source_p = decode_zooms(input_data.copy(), sample_configs=sample_configs, out_zoom=combined_zoom) if input_data else {}
+        target_p = decode_zooms(gt.copy(), sample_configs=sample_configs, out_zoom=combined_zoom) if gt else {}
+        if output is not None:
+            output_p = decode_zooms(output.copy(), sample_configs=sample_configs, out_zoom=combined_zoom)
+        else:
+            output_p = output_comp
 
         mask_p = {max_zoom: mask[max_zoom]} if mask is not None and max_zoom in mask else None
         self.log_tensor_plot(

@@ -880,6 +880,153 @@ class StaticVariableEmbedder(ZoomBaseEmbedder):
         return self.embedding_fn(emb_zoom_nh)
 
 
+class ForcingEmbedder(ZoomBaseEmbedder):
+
+    def __init__(
+        self,
+        name: str,
+        in_channels: Optional[int],
+        embed_dim: int,
+        zoom: int,
+        forcing_names: Sequence[str],
+        hidden_dim: Optional[int] = None,
+        **kwargs: Any
+    ) -> None:
+        """
+        Encode named time-dependent one-dimensional forcing profiles.
+
+        Each forcing has an independent convolutional encoder, allowing profile
+        dimensions and lengths to differ. Adaptive pooling reduces every profile
+        to a fixed-size vector before the forcing vectors are fused.
+
+        :param name: Embedder name.
+        :param in_channels: Unused compatibility argument.
+        :param embed_dim: Dimensionality of the embedding output.
+        :param zoom: Zoom level whose time window is used.
+        :param forcing_names: Ordered forcing variable names.
+        :param hidden_dim: Channels used by each profile encoder.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: None.
+        """
+        forcing_names = list(forcing_names)
+        if not forcing_names:
+            raise ValueError("ForcingEmbedder requires at least one forcing name.")
+        if len(set(forcing_names)) != len(forcing_names):
+            raise ValueError(f"Forcing names must be unique, got {forcing_names}.")
+
+        super().__init__(name, len(forcing_names), embed_dim, zoom)
+
+        self.keep_dims: List[str] = ["b", "t", "c"]
+        self.forcing_names: List[str] = forcing_names
+        self.hidden_dim: int = hidden_dim if hidden_dim is not None else embed_dim
+
+        self.profile_encoders: nn.ModuleList = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, self.hidden_dim, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.AdaptiveAvgPool1d(1),
+            )
+            for _ in self.forcing_names
+        ])
+        self.fusion: nn.Module = nn.Sequential(
+            nn.Linear(len(self.forcing_names) * self.hidden_dim, self.embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+
+    def forward(
+        self,
+        emb: Dict[int, Dict[str, torch.Tensor]],
+        output_zoom: Optional[int] = None,
+        sample_configs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        """
+        Embed forcing profiles into a per-timestep conditioning tensor.
+
+        :param emb: Zoom mapping containing named tensors shaped ``(b, t, n)``.
+        :param output_zoom: Optional output zoom used to align the time window.
+        :param sample_configs: Sampling configuration by zoom.
+        :return: Embedded forcing tensor shaped ``(b, t, embed_dim)``.
+        """
+        if self.zoom not in emb:
+            raise KeyError(
+                f"ForcingEmbedder zoom {self.zoom} is missing. Available zooms: {list(emb.keys())}."
+            )
+
+        forcing_data = emb[self.zoom]
+        expected_names = set(self.forcing_names)
+        input_names = set(forcing_data.keys())
+        if input_names != expected_names:
+            missing = sorted(expected_names - input_names)
+            unexpected = sorted(input_names - expected_names)
+            raise ValueError(
+                f"Forcing inputs do not match the configured names. "
+                f"Missing: {missing}; unexpected: {unexpected}."
+            )
+
+        ts_start = 0
+        ts_end = 0
+        if output_zoom is not None and output_zoom != self.zoom:
+            if sample_configs is None:
+                raise ValueError("sample_configs is required when aligning forcing time windows.")
+            ts_start = (
+                sample_configs[self.zoom]['n_past_ts']
+                - sample_configs[output_zoom]['n_past_ts']
+            )
+            ts_end = (
+                sample_configs[self.zoom]['n_future_ts']
+                - sample_configs[output_zoom]['n_future_ts']
+            )
+            if ts_start < 0 or ts_end < 0:
+                raise ValueError(
+                    f"Cannot expand forcing time window from zoom {self.zoom} "
+                    f"to zoom {output_zoom}."
+                )
+
+        encoded_forcings = []
+        output_shape = None
+        for forcing_name, encoder in zip(self.forcing_names, self.profile_encoders):
+            forcing = forcing_data[forcing_name]
+            if forcing.ndim != 3:
+                raise ValueError(
+                    f"Forcing '{forcing_name}' must have shape (b, t, n), "
+                    f"got {tuple(forcing.shape)}."
+                )
+
+            stop = forcing.shape[1] - ts_end if ts_end > 0 else forcing.shape[1]
+            if ts_start >= stop:
+                raise ValueError(
+                    f"Time alignment produced an empty window for forcing '{forcing_name}'."
+                )
+            forcing = forcing[:, ts_start:stop]
+
+            current_shape = forcing.shape[:2]
+            if output_shape is None:
+                output_shape = current_shape
+            elif current_shape != output_shape:
+                raise ValueError(
+                    f"Forcing '{forcing_name}' has batch/time shape {tuple(current_shape)}, "
+                    f"expected {tuple(output_shape)}."
+                )
+
+            if not torch.is_floating_point(forcing):
+                forcing = forcing.float()
+            forcing = rearrange(forcing, 'b t n -> (b t) 1 n')
+            encoded = encoder(forcing).squeeze(-1)
+            encoded_forcings.append(encoded)
+
+        forcing_embedding = self.fusion(torch.cat(encoded_forcings, dim=-1))
+        return rearrange(
+            forcing_embedding,
+            '(b t) c -> b t c',
+            b=output_shape[0],
+            t=output_shape[1],
+        )
+
+
 class MaskEmbedder(BaseEmbedder):
 
     def __init__(

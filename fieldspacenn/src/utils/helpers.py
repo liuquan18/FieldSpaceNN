@@ -5,33 +5,108 @@ import torch
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
+def _to_list(value: Any) -> List[Any]:
+    """
+    Normalize scalars and OmegaConf list types to a plain Python list.
+
+    :param value: Scalar or list-like value.
+    :return: Plain Python list.
+    """
+    if isinstance(value, (list, tuple, omegaconf.listconfig.ListConfig)):
+        return list(value)
+    return [value]
+
+
 def load_from_state_dict(model, ckpt_path, device=None, print_keys: bool = True):
     """
     Load a model from a checkpoint state dict with optional key diagnostics.
 
     :param model: Model instance with a compatible state dict.
-    :param ckpt_path: Path to the checkpoint file.
+    :param ckpt_path: Path to the checkpoint file or a list of paths.
     :param device: Optional device for torch.load map_location.
     :param print_keys: Whether to print missing/unexpected key summaries.
     :return: Tuple of (model, matching_keys).
     """
-    weights = torch.load(ckpt_path, map_location=device)
-    res = model.load_state_dict(weights['state_dict'], strict=False)
+    ckpt_paths = _to_list(ckpt_path)
 
-    if print_keys:
-        zoom_counts_missing, block_counts_missing = analyze_keys(res.missing_keys)
-        zoom_counts, block_counts = analyze_keys(res.unexpected_keys)
+    if len(ckpt_paths) == 0:
+        raise ValueError("ckpt_path must contain at least one checkpoint path")
 
-        print("Missing keys in checkpoint:")
-        for zoom, count in sorted(zoom_counts_missing.items()):
-            print(f"  Zoom level {zoom}: {count} keys")
+    matching_keys = []
+    matching_keys_set = set()
+    model_keys = set(model.state_dict().keys())
 
-        print("Unexpected keys in checkpoint:")
-        for zoom, count in sorted(zoom_counts.items()):
-            print(f"  Zoom level {zoom}: {count} keys")
-    
-    matching_keys = [key for key in weights['state_dict'].keys() if (key in model.state_dict().keys())]
+    for path in ckpt_paths:
+        weights = torch.load(path, map_location=device)
+        res = model.load_state_dict(weights['state_dict'], strict=False)
+
+        if print_keys:
+            zoom_counts_missing, _ = analyze_keys(res.missing_keys)
+            zoom_counts, _ = analyze_keys(res.unexpected_keys)
+
+            print(f"Loaded checkpoint: {path}")
+            print("Missing keys in checkpoint:")
+            for zoom, count in sorted(zoom_counts_missing.items()):
+                print(f"  Zoom level {zoom}: {count} keys")
+
+            print("Unexpected keys in checkpoint:")
+            for zoom, count in sorted(zoom_counts.items()):
+                print(f"  Zoom level {zoom}: {count} keys")
+
+        for key in weights['state_dict'].keys():
+            if key in model_keys and key not in matching_keys_set:
+                matching_keys.append(key)
+                matching_keys_set.add(key)
+
     return model, matching_keys
+
+
+def load_pretrained_checkpoints(
+    model,
+    ckpt_path,
+    freeze_pretrained: Any = False,
+    device=None,
+    print_keys: bool = True,
+):
+    """
+    Load one or more pretrained checkpoints and optionally freeze loaded parameters.
+
+    :param model: Model instance with a compatible state dict.
+    :param ckpt_path: Path to a checkpoint file or a list of paths.
+    :param freeze_pretrained: Bool or list of bools aligned with ``ckpt_path``.
+    :param device: Optional device for torch.load map_location.
+    :param print_keys: Whether to print missing/unexpected key summaries.
+    :return: Tuple of (model, frozen_keys).
+    """
+    ckpt_paths = _to_list(ckpt_path)
+    if len(ckpt_paths) == 0:
+        raise ValueError("ckpt_path must contain at least one checkpoint path")
+
+    freeze_flags = _to_list(freeze_pretrained)
+    if len(freeze_flags) == 1:
+        freeze_flags = freeze_flags * len(ckpt_paths)
+    elif len(freeze_flags) != len(ckpt_paths):
+        raise ValueError(
+            "freeze_pretrained must have the same length as ckpt_path when provided as a list"
+        )
+
+    freeze_keys = set()
+    for path, should_freeze in zip(ckpt_paths, freeze_flags):
+        model, matching_keys = load_from_state_dict(
+            model,
+            path,
+            device=device,
+            print_keys=print_keys,
+        )
+        if should_freeze:
+            freeze_keys.update(matching_keys)
+        else:
+            freeze_keys.difference_update(matching_keys)
+
+    if freeze_keys:
+        freeze_params(model, list(freeze_keys))
+
+    return model, list(freeze_keys)
 
 def extract_block_and_zoom_from_key(key: str) -> Optional[Tuple[int, int]]:
     """
@@ -243,15 +318,19 @@ def merge_sampling_dicts(
     :return: Updated sampling configuration dictionary.
     """
 
-    sample_configs = sample_configs.copy()
+    sample_configs = {
+        key: value.copy()
+        for key, value in sample_configs.items()
+    }
 
     for key, value in patch_index_zooms.items():
         if key in sample_configs.keys():
             sample_configs[key]['patch_index'] = value
 
     # Ensure every zoom has a sampling config by inheriting from the lowest defined zoom.
+    min_zoom = min(sample_configs.keys())
     for z in range(max(sample_configs.keys())):
         if z not in sample_configs.keys():
-            sample_configs[z] = sample_configs[min(sample_configs.keys())]
+            sample_configs[z] = sample_configs[min_zoom].copy()
 
     return sample_configs

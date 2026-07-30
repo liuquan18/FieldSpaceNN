@@ -1,13 +1,27 @@
 import copy
 import math
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from ..utils.helpers import check_get
 
 import torch
 import torch.nn as nn
 
-from .factorization import TuckerFacLayer
+from .factorization import (
+    TuckerFacLayer,
+    broadcast_indexed_tensor,
+    normalize_indexed_dims,
+)
+
+
+def _get_layer_variable_indices(emb: Optional[Dict[str, Any]]) -> Any:
+    if emb is None:
+        raise KeyError("Embedding dictionary is required for variable-wise parameter selection.")
+    if "variables_sampled" in emb:
+        return emb["variables_sampled"]
+    if "VariableEmbedder" in emb:
+        return emb["VariableEmbedder"]
+    raise KeyError("Expected `variables_sampled` (or fallback `VariableEmbedder`) in embedding dictionary.")
 
 
 class LayerNorm(nn.Module):
@@ -15,6 +29,7 @@ class LayerNorm(nn.Module):
         self,
         normalized_shape: Union[int, Sequence[int]],
         n_variables: int = 1,
+        indexed_dims: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
         eps: float = 1e-5,
         elementwise_affine: bool = True
     ):
@@ -34,16 +49,21 @@ class LayerNorm(nn.Module):
         self.eps: float = eps
         self.elementwise_affine: bool = elementwise_affine
         self.n_variables: int = n_variables
+        self.indexed_dims = normalize_indexed_dims(
+            indexed_dims=indexed_dims,
+            n_variables=n_variables,
+        )
 
         self.weight: Optional[nn.Parameter] = None
         self.bias: Optional[nn.Parameter] = None
         if elementwise_affine:
-            if n_variables==1:
+            indexed_shape = [spec["n_features"] for spec in self.indexed_dims.values()]
+            if not indexed_shape:
                 self.weight: nn.Parameter = nn.Parameter(torch.ones(self.normalized_shape))
                 self.bias: nn.Parameter = nn.Parameter(torch.zeros(self.normalized_shape))
             else:
-                self.weight = nn.Parameter(torch.ones(n_variables, *self.normalized_shape))
-                self.bias = nn.Parameter(torch.zeros(n_variables, *self.normalized_shape))
+                self.weight = nn.Parameter(torch.ones(*indexed_shape, *self.normalized_shape))
+                self.bias = nn.Parameter(torch.zeros(*indexed_shape, *self.normalized_shape))
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
@@ -56,13 +76,11 @@ class LayerNorm(nn.Module):
         :param emb: Optional embedding dict containing variable indices.
         :return: Affine-transformed tensor of the same shape.
         """
-        if self.n_variables==1:
+        if not self.indexed_dims:
             return self.weight * x_hat + self.bias
         else:
-            # Select variable-specific affine parameters using VariableEmbedder indices.
-            weight = self.weight[emb['VariableEmbedder']].unsqueeze(dim=2).unsqueeze(dim=2).unsqueeze(dim=2)
-            bias = self.bias[emb['VariableEmbedder']].unsqueeze(dim=2).unsqueeze(dim=2).unsqueeze(dim=2)
-            
+            weight = broadcast_indexed_tensor(self.weight, self.indexed_dims, x_hat, emb=emb)
+            bias = broadcast_indexed_tensor(self.bias, self.indexed_dims, x_hat, emb=emb)
             return weight * x_hat + bias
 
     def forward(self, x: torch.Tensor, emb: Optional[Dict[str, Any]] = None, x_stats: Optional[torch.Tensor] = None):
@@ -117,7 +135,7 @@ class IdentityLayer(nn.Module):
         if self.n_variables==1:
             return tensor
         else:
-            return tensor[emb['VariableEmbedder']]
+            return tensor[_get_layer_variable_indices(emb)]
 
     
 class MLP_fac(nn.Module):
@@ -138,7 +156,13 @@ class MLP_fac(nn.Module):
                  mult: int = 1,
                  hidden_dim: Optional[Union[int, List[int]]] = None,
                  dropout: float = 0,
-                 layer_confs: Dict[str, Any] = {},
+                 layer_confs: Optional[Dict[str, Any]] = None,
+                 ranks: Optional[List[Optional[int]]] = None,
+                 n_variables: int = 1,
+                 indexed_dims: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+                 indexed_dims_layer1: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+                 indexed_dims_layer2: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+                 fac_mode: str = "Tucker",
                  gamma: bool = False
                 ) -> None: 
       
@@ -156,8 +180,38 @@ class MLP_fac(nn.Module):
                 out_features_1 = [int(in_feat) for in_feat in in_features]
                 out_features_1[1] = hidden_dim       
 
-        self.layer1: nn.Module = get_layer(in_features, out_features_1, layer_confs=layer_confs, bias=True)
-        self.layer2: nn.Module = get_layer(out_features_1, out_features, layer_confs=layer_confs, bias=True)
+        layer_confs = {} if layer_confs is None else copy.deepcopy(layer_confs)
+        if ranks is None:
+            ranks = layer_confs.get("ranks", [None])
+        n_variables = layer_confs.get("n_variables", n_variables)
+        indexed_dims = layer_confs.get("indexed_dims", indexed_dims)
+        indexed_dims_layer1 = layer_confs.get(
+            "indexed_dims_layer1",
+            indexed_dims if indexed_dims_layer1 is None else indexed_dims_layer1,
+        )
+        indexed_dims_layer2 = layer_confs.get(
+            "indexed_dims_layer2",
+            indexed_dims if indexed_dims_layer2 is None else indexed_dims_layer2,
+        )
+        fac_mode = layer_confs.get("fac_mode", fac_mode)
+        self.layer1 = get_layer(
+            in_features,
+            out_features_1,
+            ranks=ranks,
+            n_variables=n_variables,
+            indexed_dims=indexed_dims_layer1,
+            fac_mode=fac_mode,
+            bias=True,
+        )
+        self.layer2 = get_layer(
+            out_features_1,
+            out_features,
+            ranks=ranks,
+            n_variables=n_variables,
+            indexed_dims=indexed_dims_layer2,
+            fac_mode=fac_mode,
+            bias=True,
+        )
         self.dropout: nn.Module = nn.Dropout(p=dropout) if dropout>0 else nn.Identity()
         self.activation: nn.Module = nn.SiLU()
 
@@ -195,10 +249,10 @@ class MLP_fac(nn.Module):
         :return: Output tensor with updated feature dimension.
         """
         
-        x = self.layer1(x, emb=emb)
+        x = self.layer1(x, emb=emb, **kwargs)
         x = self.activation(x)
         x = self.dropout(x)
-        x = self.layer2(x, emb=emb)
+        x = self.layer2(x, emb=emb, **kwargs)
 
         return self.rtn_fcn(x)
 
@@ -206,7 +260,12 @@ class MLP_fac(nn.Module):
 def get_layer(
         in_features: Union[int, List[int]],
         out_features: Union[int, List[int]],
-        layer_confs: Dict[str, Any] = {},
+        layer_confs: Optional[Dict[str, Any]] = None,
+        ranks: Optional[List[Optional[int]]] = None,
+        n_variables: int = 1,
+        indexed_dims: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+        fac_mode: str = "Tucker",
+        rank_variables: Optional[int] = None,
         **kwargs: Any
         ):  
     """
@@ -219,16 +278,29 @@ def get_layer(
     :return: Instantiated layer module.
     """
 
-    layer_confs = copy.deepcopy(layer_confs)
-        
-    ranks = check_get([layer_confs, kwargs, {'ranks': [None]}], 'ranks')
-    n_variables = check_get([layer_confs, kwargs, {'n_variables': 1}], 'n_variables')
-    bias = check_get([layer_confs, kwargs, {'bias': False}], 'bias')
-    fac_mode = check_get([layer_confs, kwargs, {'fac_mode': 'Tucker'}], 'fac_mode')
+    layer_confs = {} if layer_confs is None else copy.deepcopy(layer_confs)
+    if ranks is None:
+        ranks = layer_confs.get("ranks", [None])
+    else:
+        ranks = copy.deepcopy(ranks)
+    n_variables = layer_confs.get("n_variables", n_variables)
+    indexed_dims = layer_confs.get("indexed_dims", indexed_dims)
+    fac_mode = layer_confs.get("fac_mode", fac_mode)
+    if rank_variables is None:
+        rank_variables = layer_confs.get("rank_variables", None)
+    layer_kwargs = copy.deepcopy(kwargs)
+    bias = check_get([layer_kwargs, {'bias': False}], 'bias')
+    layer_kwargs.pop("bias", None)
 
     ranks_not_none = [rank is not None for rank in ranks]
 
-    if not any(ranks_not_none) and n_variables==1:
+    indexed_dims_norm = normalize_indexed_dims(
+        indexed_dims=indexed_dims,
+        n_variables=n_variables,
+        rank_variables=rank_variables,
+    )
+
+    if not any(ranks_not_none) and not indexed_dims_norm:
         # Use a standard linear layer when no factorization is requested.
         layer = LinearLayer(
                 in_features,
@@ -242,7 +314,12 @@ def get_layer(
             in_features,
             out_features,
             bias = bias,
-            **layer_confs)
+            ranks=ranks,
+            n_variables=n_variables,
+            indexed_dims=indexed_dims_norm,
+            rank_variables=rank_variables,
+            **layer_kwargs,
+        )
         
     else:
         raise NotImplementedError

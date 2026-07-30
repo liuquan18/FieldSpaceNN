@@ -14,6 +14,8 @@ class HealPixLoader(BaseDataset):
         data_dict: Mapping[str, Any],
         sampling_zooms: Mapping[int, Mapping[str, Any]],
         sampling_zooms_collate: Optional[Mapping[int, Mapping[str, Any]]] = None,
+        sampling_times_emb: Optional[Mapping[str, Any]] = None,
+        sampling_zooms_target: Mapping[int, Mapping[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -22,6 +24,8 @@ class HealPixLoader(BaseDataset):
         :param data_dict: Dataset configuration including source/target file paths.
         :param sampling_zooms: Sampling configuration keyed by zoom level.
         :param sampling_zooms_collate: Optional collate configuration keyed by zoom level.
+        :param sampling_times_emb: Optional shared embedding-only time window with
+            ``n_past_ts`` and ``n_future_ts``.
         :param kwargs: Additional arguments forwarded to the base dataset initializer.
         :return: None.
         """
@@ -30,10 +34,18 @@ class HealPixLoader(BaseDataset):
             sampling_zooms = OmegaConf.to_container(sampling_zooms, resolve=True)
         if isinstance(sampling_zooms_collate, (DictConfig, ListConfig)):
             sampling_zooms_collate = OmegaConf.to_container(sampling_zooms_collate, resolve=True)
+        if isinstance(sampling_times_emb, (DictConfig, ListConfig)):
+            sampling_times_emb = OmegaConf.to_container(sampling_times_emb, resolve=True)
         self.sampling_zooms: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms)
         self.sampling_zooms_collate: Optional[Mapping[int, Mapping[str, Any]]] = copy.deepcopy(
             sampling_zooms_collate
         )
+        self.sampling_times_emb: Optional[Mapping[str, Any]] = copy.deepcopy(sampling_times_emb)
+
+        if sampling_zooms_target is None:
+            self.sampling_zooms_target: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms)
+        else:
+            self.sampling_zooms_target: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms_target)
 
         # Build patch indices per zoom from the HealPix pixelization scheme.
         self.indices: Dict[int, np.ndarray] = {}

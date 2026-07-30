@@ -5,3 +5,4 @@ log_snapshot_images: false
 save_dir: ${run_dir}/logs/${project_name}/${run_name}/
 project: ${project_name}
 name: ${run_name}
+plot_types: ['zooms']

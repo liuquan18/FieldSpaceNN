@@ -14,6 +14,7 @@ class LightningMGAutoEncoderModel(LightningMGModel, LightningProbabilisticModel)
         model: Any,
         lr_groups: Mapping[str, Mapping[str, Any]],
         lambda_loss_dict: Dict[str, float],
+        data_variables: Optional[Mapping[str, Any]] = None,
         kl_weight: float = 1e-6,
         weight_decay: float = 0.0,
         n_samples: int = 1,
@@ -37,6 +38,7 @@ class LightningMGAutoEncoderModel(LightningMGModel, LightningProbabilisticModel)
             model,  # Main VAE model
             lr_groups,
             lambda_loss_dict=lambda_loss_dict,
+            data_variables=data_variables,
             weight_decay=weight_decay
         )
 
@@ -127,9 +129,32 @@ class LightningMGAutoEncoderModel(LightningMGModel, LightningProbabilisticModel)
             emb = emb_groups[group_idx]
 
             # Decode outputs to the maximum zoom for visualization.
-            output_comp = decode_zooms(output.copy(), sample_configs=sample_configs, out_zoom=max_zoom)
 
-            self.logger.log_healpix_tensor_plot(source, output, target, mask, sample_configs, emb, max_zoom, self.current_epoch, output_comp=output_comp)
+            self.logger.log_tensor_plot(
+                plot_types=["healpix_plot_zooms_var"],
+                input=source,
+                output=output,
+                gt=target,
+                mask=mask,
+                sample_configs=sample_configs,
+                emb=emb,
+                plot_name=f"epoch_{self.current_epoch}",
+            )
+
+            source_comp = decode_zooms(source, sample_configs=sample_configs, out_zoom=max_zoom)
+            target_comp = decode_zooms(target, sample_configs=sample_configs, out_zoom=max_zoom)
+            output_comp = decode_zooms(output.copy(), sample_configs=sample_configs, out_zoom=max_zoom)
+            
+            self.logger.log_tensor_plot(
+                plot_types=["healpix_plot_zooms_var"],
+                input=source_comp,
+                output=output_comp,
+                gt=target_comp,
+                mask={max_zoom: mask[max_zoom]} if mask is not None and max_zoom in mask else None,
+                sample_configs=sample_configs,
+                emb=emb,
+                plot_name=f"epoch_{self.current_epoch}_combined",
+            )
 
         return loss
 

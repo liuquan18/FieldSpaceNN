@@ -1,6 +1,8 @@
 import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+import math
 from omegaconf import ListConfig
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -101,17 +103,7 @@ class ZoomBaseEmbedder(nn.Module):
             expanded to ``embed_dim``.
         """
         # Apply the embedder to the input tensor
-        emb = emb[self.zoom]
-
-        if output_zoom is not None and output_zoom != self.zoom and 't' in self.keep_dims:
-            t_dim =  2 - int('v' in self.keep_dims) - int('b' in self.keep_dims)
-
-            ts_start = sample_configs[self.zoom]['n_past_ts'] - sample_configs[output_zoom]['n_past_ts']
-            ts_end = sample_configs[self.zoom]['n_future_ts'] - sample_configs[output_zoom]['n_future_ts']
-
-            nt = emb.shape[t_dim]
-
-            emb = torch.index_select(emb, dim=t_dim, index=torch.arange(ts_start, nt - ts_end, device=emb.device))
+        emb = emb[output_zoom] if output_zoom is not None and output_zoom in emb else emb[self.zoom]
         
         return self.embedding_fn(emb)
 
@@ -158,6 +150,166 @@ class TimeEmbedder(ZoomBaseEmbedder):
         )
 
 
+class TimeIndexEmbedder(ZoomBaseEmbedder):
+    def __init__(
+        self,
+        name: str,
+        in_channels: int,
+        embed_dim: int,
+        zoom: int,
+        init_value: Optional[float] = None,
+        **kwargs: Any
+    ) -> None:
+        """
+        Learn a time-position embedding indexed by the time axis length.
+
+        :param name: Embedder name.
+        :param in_channels: Maximum supported number of time indices.
+        :param embed_dim: Dimensionality of the embedding output.
+        :param zoom: Zoom level this embedder operates on.
+        :param init_value: Optional constant initialization value.
+        :return: None.
+        """
+        super().__init__(name, in_channels, embed_dim, zoom)
+
+        self.keep_dims: List[str] = ["b", "t", "c"]
+        self.zoom: int = zoom
+        self.embedding_fn: nn.Module = nn.Embedding(self.in_channels, self.embed_dim)
+
+        if init_value is not None:
+            self.embedding_fn.weight.data.fill_(init_value)
+
+    def forward(
+        self,
+        emb: Dict[int, torch.Tensor],
+        output_zoom: Optional[int] = None,
+        sample_configs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        emb_zoom = emb[output_zoom] if output_zoom is not None and output_zoom in emb else emb[self.zoom]
+
+        batch_size = emb_zoom.shape[0]
+        n_time = emb_zoom.shape[1]
+        if n_time > self.in_channels:
+            raise ValueError(
+                f"`TimeIndexEmbedder` supports at most {self.in_channels} time indices, but received {n_time}."
+            )
+
+        time_indices = torch.arange(n_time, device=emb_zoom.device, dtype=torch.long).view(1, -1).expand(batch_size, -1)
+        return self.embedding_fn(time_indices)
+
+
+class TimeProgressEmbedder(ZoomBaseEmbedder):
+    def __init__(
+        self,
+        name: str,
+        in_channels: int,
+        embed_dim: int,
+        zoom: int,
+        grid_layers: Optional[Dict[str, GridLayer]] = None,
+        wave_length: float = 1.0,
+        wave_length_2: Optional[float] = None,
+        **kwargs: Any
+    ) -> None:
+        """
+        Embed raw day/year phase fractions, optionally varying per spatial token.
+
+        :param name: Embedder name.
+        :param in_channels: Number of phase channels (expected: 2).
+        :param embed_dim: Dimensionality of the embedding output.
+        :param zoom: Zoom level this embedder operates on.
+        :param wave_length: Primary wavelength for random Fourier features.
+        :param wave_length_2: Optional secondary wavelength.
+        :return: None.
+        """
+        super().__init__(name, in_channels, embed_dim, zoom)
+
+        self.keep_dims: List[str] = ["b", "t", "s", "c"]
+        self.zoom: int = zoom
+        self.grid_layer: Optional[GridLayer] = None if grid_layers is None else grid_layers[str(zoom)]
+
+        longitude_fraction = torch.empty(0, dtype=torch.float32)
+        if self.grid_layer is not None:
+            lon_rad = self.grid_layer.coordinates[..., 0].reshape(-1).to(torch.float32)
+            longitude_fraction = lon_rad / (2 * torch.pi)
+        self.register_buffer("longitude_fraction", longitude_fraction, persistent=False)
+        self.longitude_fraction: torch.Tensor
+
+        self.embedding_fn: nn.Module = nn.Sequential(
+            RandomFourierLayer(
+                in_features=self.in_channels,
+                n_neurons=self.embed_dim,
+                wave_length=wave_length,
+                wave_length_2=wave_length_2,
+            ),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+
+    def _get_patch_longitude_fraction(
+        self,
+        zoom: int,
+        sample_configs: Optional[Dict[str, Any]],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.longitude_fraction.numel() == 0:
+            return None
+
+        lon_fraction = self.longitude_fraction.to(device=device, dtype=dtype)
+        if self.grid_layer is not None and sample_configs is not None and zoom in sample_configs:
+            idx = self.grid_layer.get_idx_of_patch(
+                **sample_configs[zoom],
+                return_local=False,
+            )
+            lon_fraction = lon_fraction[idx]
+            if lon_fraction.ndim == 1:
+                lon_fraction = lon_fraction.view(1, 1, -1, 1)
+            else:
+                lon_fraction = lon_fraction.view(lon_fraction.shape[0], 1, lon_fraction.shape[1], 1)
+        else:
+            lon_fraction = lon_fraction.view(1, 1, -1, 1)
+
+        return lon_fraction
+
+    def forward(
+        self,
+        emb: Dict[int, torch.Tensor],
+        output_zoom: Optional[int] = None,
+        sample_configs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        zoom_key = output_zoom if output_zoom is not None and output_zoom in emb else self.zoom
+        if not zoom_key in emb.keys():
+            zoom_key = int((torch.tensor(list(emb.keys()),dtype=torch.int) - output_zoom).abs().argmin())
+            zoom_key = list(emb.keys())[zoom_key]
+        emb_zoom = emb[zoom_key]
+
+        if emb_zoom.ndim == 3:
+            emb_zoom = emb_zoom.unsqueeze(2)
+
+        lon_fraction = self._get_patch_longitude_fraction(
+            zoom=zoom_key,
+            sample_configs=sample_configs,
+            device=emb_zoom.device,
+            dtype=emb_zoom.dtype,
+        )
+        if lon_fraction is not None:
+            if emb_zoom.shape[2] == 1 and lon_fraction.shape[2] != 1:
+                emb_zoom = emb_zoom.expand(-1, -1, lon_fraction.shape[2], -1)
+            elif emb_zoom.shape[2] != lon_fraction.shape[2]:
+                raise ValueError(
+                    f"`TimeProgressEmbedder` expected {lon_fraction.shape[2]} spatial positions at zoom {self.zoom}, "
+                    f"but received {emb_zoom.shape[2]}."
+                )
+
+            emb_zoom = emb_zoom.clone()
+            emb_zoom[..., 0:1] = torch.remainder(emb_zoom[..., 0:1] + lon_fraction, 1.0)
+
+        return self.embedding_fn(emb_zoom)
+
+
 class CoordinateEmbedder(ZoomBaseEmbedder):
     """
     A neural network module to embed longitude and latitude coordinates.
@@ -175,7 +327,9 @@ class CoordinateEmbedder(ZoomBaseEmbedder):
         wave_length_2: Optional[float] = None,
         zoom: Optional[int] = None,
         zoom_max: Optional[int] = None,
-        layer_confs: Dict[str, Any] = {},
+        ranks: Optional[List[Optional[int]]] = None,
+        n_variables: int = 1,
+        fac_mode: str = "Tucker",
         **kwargs: Any
     ) -> None:
         """
@@ -207,7 +361,7 @@ class CoordinateEmbedder(ZoomBaseEmbedder):
             wave_length=wave_length,
             wave_length_2=wave_length_2,
         )
-        self.mlp: nn.Module = MLP_fac(self.embed_dim, self.embed_dim, mult=1, dropout=0, layer_confs=layer_confs, gamma=False)
+        self.mlp = MLP_fac(self.embed_dim, self.embed_dim, mult=1, dropout=0, ranks=ranks, n_variables=n_variables, fac_mode=fac_mode, gamma=False)
 
     def forward(self, coordinates_emb: Tuple[torch.Tensor, torch.Tensor], **kwargs: Any) -> torch.Tensor:
         """
@@ -272,7 +426,7 @@ class MGEmbedder(BaseEmbedder):
 
         self.grid_layer: GridLayer = grid_layers[str(zoom)]
         # keep batch, spatial, variable and channel dimensions
-        self.keep_dims: List[str] = ["b", "v", "t", "s", "c"]
+        self.keep_dims: List[str] = ["b", "v", "s", "c"]
 
         self.get_emb_fcn: Callable[[torch.Tensor], torch.Tensor]
         if n_variables == 1:
@@ -332,7 +486,6 @@ class MGEmbedder(BaseEmbedder):
 
         embs = get_emb_fcn(var_indices)
         embs = self.get_patch(embs, sample_configs=sample_configs)
-        embs = embs.unsqueeze(dim=2)
 
         return embs
 
@@ -353,7 +506,9 @@ class DensityEmbedder(BaseEmbedder):
         wave_length: float = 1.0,
         wave_length_2: Optional[float] = None,
         zoom: Optional[int] = None,
-        layer_confs: Dict[str, Any] = {},
+        ranks: Optional[List[Optional[int]]] = None,
+        n_variables: int = 1,
+        fac_mode: str = "Tucker",
         **kwargs: Any
     ) -> None:
         """
@@ -383,7 +538,7 @@ class DensityEmbedder(BaseEmbedder):
             wave_length=wave_length,
             wave_length_2=wave_length_2,
         )
-        self.mlp: nn.Module = MLP_fac(self.embed_dim, self.embed_dim, mult=1, dropout=0, layer_confs=layer_confs, gamma=False)
+        self.mlp = MLP_fac(self.embed_dim, self.embed_dim, mult=1, dropout=0, ranks=ranks, n_variables=n_variables, fac_mode=fac_mode, gamma=False)
     
     def forward(self, density_emb: Tuple[Dict[int, torch.Tensor], torch.Tensor], **kwargs: Any) -> torch.Tensor:
         """
@@ -453,6 +608,170 @@ class VariableEmbedder(BaseEmbedder):
 
 
 
+class GroupDepthEmbedder(BaseEmbedder):
+
+    def __init__(
+        self,
+        name: str,
+        in_channels: Optional[int],
+        embed_dim: int,
+        in_features: Sequence[Optional[int]],
+        init_value: Optional[float] = None,
+        **kwargs: Any
+    ) -> None:
+        """
+        Initialize per-group depth embeddings.
+
+        :param name: Embedder name.
+        :param in_channels: Unused legacy argument kept for config compatibility.
+        :param embed_dim: Dimensionality of the embedding output.
+        :param in_features: Number of depth entries available for each group.
+        :param init_value: Optional constant initialization value.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: None.
+        """
+        super().__init__(name, 0 if in_channels is None else in_channels, embed_dim)
+
+        self.keep_dims: List[str] = ["b", "d", "c"]
+        self.in_features: List[Optional[int]] = [None if feat is None else int(feat) for feat in in_features]
+        self.embedding_fn: nn.ModuleList = nn.ModuleList(
+            [
+                nn.Embedding(group_in_features, self.embed_dim)
+                if group_in_features is not None and group_in_features > 0
+                else nn.Identity()
+                for group_in_features in self.in_features
+            ]
+        )
+
+        if init_value is not None:
+            for embedder in self.embedding_fn:
+                if isinstance(embedder, nn.Embedding):
+                    embedder.weight.data.fill_(init_value)
+
+    def forward(
+        self,
+        emb: Tuple[Union[int, torch.Tensor], torch.Tensor],
+        output_zoom: Optional[int] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        """
+        Embed depth indices for a specific variable group.
+
+        :param emb: Tuple of ``(group_id, depth_ids)`` where ``group_id`` selects the
+            group-specific embedding table and ``depth_ids`` indexes the depth entries.
+        :param output_zoom: Unused.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: Depth embedding tensor of shape ``(d, embed_dim)`` or compatible.
+        """
+        group_id, depth_ids = emb
+        if isinstance(group_id, torch.Tensor):
+            if group_id.numel()>1:
+                group_id = group_id[0]
+            group_id = int(group_id.item())
+        else:
+            group_id = int(group_id)
+
+        if group_id >= len(self.embedding_fn):
+            raise IndexError(f"group_id {group_id} out of range for {len(self.embedding_fn)} group depth embedders")
+
+        group_in_features = self.in_features[group_id]
+        if group_in_features is None or group_in_features <= 0:
+            return torch.zeros(*depth_ids.shape, 1, self.embed_dim, device=depth_ids.device)
+
+        return self.embedding_fn[group_id](depth_ids)
+
+
+class PressureLevelEmbedder(BaseEmbedder):
+
+    def __init__(
+        self,
+        name: str,
+        in_channels: Optional[int],
+        embed_dim: int,
+        reference_pressure_hpa: Optional[float] = 1100,
+        top_pressure_hpa: Optional[float] = 50,
+        use_surface_embedding: Optional[bool] = True,
+        **kwargs: Any
+    ) -> None:
+        """
+        Initialize per-group depth embeddings.
+
+        :param name: Embedder name.
+        :param in_channels: Unused legacy argument kept for config compatibility.
+        :param embed_dim: Dimensionality of the embedding output.
+        :param init_value: Optional constant initialization value.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: None.
+        """
+        super().__init__(name, 0 if in_channels is None else in_channels, embed_dim)
+
+        self.keep_dims: List[str] = ["b", "d", "c"]
+        self.in_features: List[Optional[int]] = [None if feat is None else int(feat) for feat in in_channels]
+
+        self.top_pressure_hpa = top_pressure_hpa
+        self.reference_pressure_hpa = reference_pressure_hpa
+
+        self.embedding_fn: nn.ModuleList = nn.ModuleList()
+        self.forward_fcns = []
+
+        self.use_surface_embedding = use_surface_embedding 
+        if any(features == 1 for features in in_channels) and use_surface_embedding:
+            self.use_surface_embedding = True
+            self.surface_embedding = nn.Parameter(torch.empty(1, self.embed_dim))
+            nn.init.normal_(self.surface_embedding) 
+
+        if any(features > 1 for features in in_channels):
+            self.pressure_level_embedder: nn.Module = nn.Sequential(
+            RandomFourierLayer(
+                in_features=1,
+                n_neurons=self.embed_dim,
+                wave_length=1
+            ),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+            
+    def normalize_pressure(
+        self,
+        pressure_hpa: torch.Tensor,
+    ) -> torch.Tensor:
+        pressure_hpa = self.reference_pressure_hpa - pressure_hpa.clamp_min(1e-4)
+
+        log_pressure_range = math.log(self.reference_pressure_hpa / self.top_pressure_hpa)
+        log_reference_pressure = math.log(self.reference_pressure_hpa)
+
+        log_height_coordinate = (
+            log_reference_pressure - torch.log(pressure_hpa)
+        )
+
+        return log_height_coordinate / log_pressure_range
+        
+    def forward(
+        self,
+        emb: Tuple[Union[int, torch.Tensor], torch.Tensor],
+        output_zoom: Optional[int] = None,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        """
+        Embed depth indices for a specific variable group.
+
+        :param emb: Tuple of ``(group_id, depth_ids)`` where ``group_id`` selects the
+            group-specific embedding table and ``depth_ids`` indexes the depth entries.
+        :param output_zoom: Unused.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: Depth embedding tensor of shape ``(d, embed_dim)`` or compatible.
+        """
+        if emb.dim() == 1 and self.use_surface_embedding:
+            return self.surface_embedding.expand(emb.shape[0],-1).view(emb.shape[0],1,-1)
+        
+        else:
+            return self.pressure_level_embedder(
+                self.normalize_pressure(emb).unsqueeze(dim=-1)
+                )
+
+
+
 class StaticVariableFieldReshaper(nn.Module):
 
     def __init__(self) -> None:
@@ -478,7 +797,15 @@ class StaticVariableFieldReshaper(nn.Module):
 
 class StaticVariableEmbedder(ZoomBaseEmbedder):
 
-    def __init__(self, name: str, in_channels: int, embed_dim: int, zoom: int, **kwargs) -> None:
+    def __init__(
+        self,
+        name: str,
+        in_channels: int,
+        embed_dim: int,
+        zoom: int,
+        grid_layers: Optional[Dict[str, GridLayer]] = None,
+        **kwargs: Any,
+    ) -> None:
         """
         Initialize the static variable embedder.
 
@@ -486,6 +813,7 @@ class StaticVariableEmbedder(ZoomBaseEmbedder):
         :param in_channels: Number of input features.
         :param embed_dim: Dimensionality of the embedding output.
         :param zoom: Zoom level this embedder operates on.
+        :param grid_layers: Optional grid layers used to gather spatial neighborhoods.
         :param kwargs: Additional keyword arguments (unused).
         :return: None.
         """
@@ -494,12 +822,62 @@ class StaticVariableEmbedder(ZoomBaseEmbedder):
         self.keep_dims: List[str] = ["b", "t", "s", "c"]
 
         self.zoom: int = zoom
+        self.grid_layers: Dict[str, GridLayer] = {} if grid_layers is None else grid_layers
+        self.nh_size: int = 1
+        if str(self.zoom) in self.grid_layers:
+            self.nh_size = int(self.grid_layers[str(self.zoom)].adjc.shape[-1])
 
         self.embedding_fn: nn.Module = nn.Sequential(
-            nn.Linear(self.in_channels, self.embed_dim),
+            nn.Linear(self.in_channels * self.nh_size, self.embed_dim),
             nn.SiLU(),
             nn.Linear(self.embed_dim, self.embed_dim),
         )
+
+    def forward(
+        self,
+        emb: Dict[int, torch.Tensor],
+        output_zoom: Optional[int] = None,
+        sample_configs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """
+        Embed static variables after augmenting each cell with its local neighborhood.
+
+        :param emb: Mapping of zoom to tensors shaped like ``(b, t, n, f)``.
+        :param output_zoom: Optional output zoom level.
+        :param sample_configs: Optional sampling configuration dictionary.
+        :param kwargs: Additional keyword arguments (unused).
+        :return: Embedded tensor of shape ``(b, t, n, embed_dim)``.
+        """
+        zoom = output_zoom if output_zoom is not None and output_zoom in emb else self.zoom
+        if zoom not in emb:
+            target_zoom = self.zoom if output_zoom is None else output_zoom
+            available_zooms = list(emb.keys())
+            zoom = min(available_zooms, key=lambda zoom_key: abs(int(zoom_key) - int(target_zoom)))
+
+        emb_zoom = emb[zoom]
+
+        if emb_zoom.ndim == 3:
+            emb_zoom = emb_zoom.unsqueeze(1)
+
+        grid_layer = self.grid_layers[str(zoom)]
+        if grid_layer is None:
+            return self.embedding_fn(emb_zoom)
+
+        if sample_configs is None:
+            sample_config = {}
+            if emb_zoom.shape[-2] != grid_layer.adjc.shape[0]:
+                raise ValueError(
+                    "`StaticVariableEmbedder` requires `sample_configs` for patch-local inputs "
+                    "when neighborhood features are enabled."
+                )
+        else:
+            sample_config = sample_configs.get(zoom, {})
+
+        emb_zoom_nh, _ = grid_layer.get_nh(emb_zoom.unsqueeze(1), **sample_config)
+        emb_zoom_nh = rearrange(emb_zoom_nh, "b 1 t s nh f -> b t s (nh f)")
+
+        return self.embedding_fn(emb_zoom_nh)
 
 
 class ForcingEmbedder(ZoomBaseEmbedder):
@@ -760,6 +1138,30 @@ class EmbedderManager:
             self.shared_embedders: Dict[str, BaseEmbedder] = {}
             self._initialized = True
 
+    @staticmethod
+    def _normalize_cache_value(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        if isinstance(value, Mapping):
+            return tuple(
+                sorted((str(key), EmbedderManager._normalize_cache_value(val)) for key, val in value.items())
+            )
+        if isinstance(value, (list, tuple, ListConfig)):
+            return tuple(EmbedderManager._normalize_cache_value(item) for item in value)
+        if isinstance(value, nn.Module):
+            return ("module", value.__class__.__name__, id(value))
+        return repr(value)
+
+    def _get_shared_cache_key(
+        self,
+        name: str,
+        in_channels: Optional[int],
+        embed_dim: Optional[int],
+        kwargs: Dict[str, Any],
+    ) -> str:
+        normalized_kwargs = self._normalize_cache_value(kwargs)
+        return repr((name, in_channels, embed_dim, normalized_kwargs))
+
     def get_embedder(
         self,
         name: str,
@@ -783,9 +1185,10 @@ class EmbedderManager:
         # Use getattr to get the class from the current module
         embedder_class = getattr(current_module, name)
         if shared:
-            if name not in self.shared_embedders.keys():
-                self.shared_embedders[name] = embedder_class(name, in_channels, embed_dim, **kwargs)
-            return self.shared_embedders[name]
+            cache_key = self._get_shared_cache_key(name, in_channels, embed_dim, kwargs)
+            if cache_key not in self.shared_embedders.keys():
+                self.shared_embedders[cache_key] = embedder_class(name, in_channels, embed_dim, **kwargs)
+            return self.shared_embedders[cache_key]
         else:
             # Create a new instance each time
             return embedder_class(name, in_channels, embed_dim, **kwargs)
@@ -807,6 +1210,23 @@ class EmbedderSequential(nn.Module):
         self.mode: str = mode
         self.spatial_dim_count: int = spatial_dim_count
         self.activation: nn.Module = nn.Identity()
+
+    @staticmethod
+    def _get_variable_embedder_size(inputs: Dict[str, Any]) -> Optional[int]:
+        """
+        Infer the runtime variable axis size from the variable embedder input.
+
+        :param inputs: Embedding input mapping passed to the sequential embedder.
+        :return: Number of runtime variables if available, otherwise None.
+        """
+        var_input = inputs.get("VariableEmbedder", inputs.get("variables_sampled"))
+        if not isinstance(var_input, torch.Tensor):
+            return None
+        if var_input.ndim == 0:
+            return 1
+        if var_input.ndim == 1:
+            return int(var_input.shape[0])
+        return int(var_input.shape[1])
 
     def get_embedding_dims(self) -> List[str]:
         """
@@ -867,6 +1287,7 @@ class EmbedderSequential(nn.Module):
         :return: Combined embedding tensor with shape ``(b, v, t, s, c)``.
         """
         embeddings = []
+        variable_embedder_size = self._get_variable_embedder_size(inputs)
 
         # Apply each embedder to its respective input
         for embedder_name, embedder in self.embedders.items():
@@ -885,6 +1306,12 @@ class EmbedderSequential(nn.Module):
 
             # Reshape the output to the target output_shape
             embed_output = expand_tensor(embed_output, dims=4 + self.spatial_dim_count, keep_dims=embedder.keep_dims)
+            if variable_embedder_size is not None and embed_output.shape[1] == 1 and variable_embedder_size > 1:
+                embed_output = embed_output.expand(
+                    embed_output.shape[0],
+                    variable_embedder_size,
+                    *embed_output.shape[2:],
+                )
             embeddings.append(embed_output)
 
         # Combine embeddings according to the mode

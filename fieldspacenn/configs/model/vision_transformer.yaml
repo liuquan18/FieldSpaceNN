@@ -1,5 +1,10 @@
 _target_: fieldspacenn.src.models.mg_transformer.pl_mg_model.LightningMGModel
+data_variables: ${data_variables}
 lambda_loss_dict:
+  aggregation: mean
+  depth_loss_scaler:
+    minimum: 0.2
+    slope: 0.001
   zooms:
     MSE_loss: 1
 weight_decay: 0
@@ -15,14 +20,11 @@ model:
   out_features: 1
   lift_features: 1
   n_head_channels: 32
-  masked_residual: true
   use_mask: false
-  layer_confs:
-    n_groups: 1
-  layer_confs_emb:
-    n_groups: 1
-    aggregation: 'shift_scale'
+  emb_aggregation: shift_scale
   block_configs:
+    "res_save_0":
+      _target_: fieldspacenn.src.models.mg_transformer.residual_blocks.ResidualSaveConfig
     "patch-to-token":
       _target_: fieldspacenn.src.modules.multi_grid.confs.MGFieldLayerConfig
       target_features: [512]
@@ -57,5 +59,9 @@ model:
       target_zooms: [6]
       field_zoom: 3
       out_zooms: [6]
+    "res_apply_0":
+      _target_: fieldspacenn.src.models.mg_transformer.residual_blocks.ResidualApplyConfig
+      mode: masked
+      clear_after_apply: true
     "conservative": 
       _target_: fieldspacenn.src.modules.multi_grid.confs.MGConservativeConfig

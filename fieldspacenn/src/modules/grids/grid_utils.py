@@ -686,14 +686,14 @@ def to_zoom(
 
     scale_factor = 4 ** abs(in_zoom - out_zoom)
     
-    vt = x.shape[:2]
+    prefix = x.shape[:-3]
     dc = x.shape[-2:]
 
     if in_zoom > out_zoom:
         # Downsample by averaging.
-        x = x.view(*vt, -1, scale_factor, *dc)
+        x = x.view(*prefix, -1, scale_factor, *dc)
         if mask is not None:
-            mask = mask.reshape(*vt, -1, scale_factor, *mask.shape[-2:])
+            mask = mask.reshape(*prefix, -1, scale_factor, *mask.shape[-2:])
             weight = mask.sum(dim=-3, keepdim=True)
             x_zoom = (x * mask).sum(dim=-3, keepdim=True) / weight.clamp(min=1e-6)
             x_zoom[weight == 0] = 0
@@ -994,13 +994,13 @@ def encode_zooms(
         # Align higher zoom to current zoom and compute residuals.
         bvt = x.shape[:-3]
         x_h_patch = get_matching_time_patch(x_h, zoom_h, zoom, sample_configs, patch_index_zooms)
-
-        x = x.view(*bvt, -1, 4**(zoom-zoom_h), *x.shape[-2:]) - x_h_patch.unsqueeze(dim=-3)
+        x = x.view(*bvt, -1, 4**(zoom-zoom_h), *x.shape[-2:])
+        x.sub_(x_h_patch.unsqueeze(dim=-3))
 
         if batched:
-            x_zooms[zoom] = x.view(*bvt, -1, *x.shape[-2:])
+            x_zooms[zoom] = x.reshape(*bvt, -1, *x.shape[-2:])
         else:
-            x_zooms[zoom] = x.view(*bvt[1:], -1, *x.shape[-2:])
+            x_zooms[zoom] = x.reshape(*bvt[1:], -1, *x.shape[-2:])
 
     return x_zooms
     
@@ -1013,24 +1013,41 @@ def decode_zooms(x_zooms: Dict[int, torch.Tensor], sample_configs: Dict, out_zoo
     :param out_zoom: Target zoom level to decode.
     :return: Dict containing the reconstructed tensor at out_zoom.
     """
-    x = 0
+    active_zooms = [zoom for zoom in sorted(x_zooms.keys()) if zoom <= out_zoom]
+    if not active_zooms:
+        raise ValueError(f"decode_zooms requires at least one zoom <= out_zoom={out_zoom}.")
+
     remove_batch_dim = False
-    for zoom in sorted(x_zooms.keys(),reverse=True):
-        if zoom > out_zoom:
-            continue  # Skip higher-resolution than target
+    x: Optional[torch.Tensor] = None
+    current_zoom: Optional[int] = None
+    for zoom in active_zooms:
         if x_zooms[zoom].ndim == 4:
             x_zoom = x_zooms[zoom].unsqueeze(dim=0)
             remove_batch_dim = True
         else:
             x_zoom = x_zooms[zoom]
-        # Align time and patches to the target zoom.
-        x_zoom = get_matching_time_patch(x_zoom,zoom,out_zoom, sample_configs)  # shape [..., N, C]
-        up_factor = 4 ** (out_zoom - zoom)
-        x_zoom = x_zoom.unsqueeze(-3).repeat_interleave(up_factor, dim=-3)
 
-        x = x + x_zoom.view(*x_zoom.shape[:3],-1,*x_zoom.shape[-2:])
-    
+        x_zoom = get_matching_time_patch(x_zoom, zoom, zoom, sample_configs)
+
+        if x is None:
+            x = x_zoom
+            current_zoom = zoom
+            continue
+
+        assert current_zoom is not None
+        x = get_matching_time_patch(x, current_zoom, zoom, sample_configs)
+        up_factor = 4 ** (zoom - current_zoom)
+        x = x.unsqueeze(-3).repeat_interleave(up_factor, dim=-3).reshape(*x.shape[:3], -1, *x.shape[-2:])
+        x = x + x_zoom
+        current_zoom = zoom
+
+    assert x is not None
+    assert current_zoom is not None
+    if current_zoom < out_zoom:
+        x = get_matching_time_patch(x, current_zoom, out_zoom, sample_configs)
+        up_factor = 4 ** (out_zoom - current_zoom)
+        x = x.unsqueeze(-3).repeat_interleave(up_factor, dim=-3).reshape(*x.shape[:3], -1, *x.shape[-2:])
+
     if remove_batch_dim:
         return {out_zoom: x.squeeze(dim=0)}
-    else:
-        return {out_zoom: x}
+    return {out_zoom: x}

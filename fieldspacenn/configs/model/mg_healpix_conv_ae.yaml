@@ -1,6 +1,11 @@
 _target_: fieldspacenn.src.models.mg_autoencoder.pl_mg_model.LightningMGAutoEncoderModel
+data_variables: ${data_variables}
 kl_weight: 1.0e-10
 lambda_loss_dict:
+  aggregation: mean
+  depth_loss_scaler:
+    minimum: 0.2
+    slope: 0.001
   zooms:
     3:
       MSE_loss: 1

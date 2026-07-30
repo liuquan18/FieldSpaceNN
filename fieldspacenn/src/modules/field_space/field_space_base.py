@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import string
 
@@ -11,6 +11,7 @@ from ..grids.grid_layer import GridLayer
 from ..grids.grid_utils import insert_matching_time_patch, get_matching_time_patch, decode_zooms
 
 _AXIS_POOL = list("g") + list(string.ascii_lowercase.replace("g","")) + list(string.ascii_uppercase)
+GLOBAL_EMBEDDER_CACHE_KEY = "_global_embedder_cache"
 
 
 def add_depth_overlap_from_neighbor_patches(
@@ -266,10 +267,15 @@ class EmbLayer(nn.Module):
         out_features: Union[List[int], int],
         embedder: Any,
         in_features: Optional[Union[List[int], int]] = None,
-        layer_confs_emb: Dict[str, Any] = {},
+        emb_aggregation: str = "shift_scale",
+        emb_ranks: Optional[List[Optional[int]]] = None,
+        n_variables: int = 1,
+        indexed_dims: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+        fac_mode: str = "Tucker",
         spatial_dim_count: int = 1,
         field_tokenizer: Optional[Tokenizer] = None,
-        output_zoom: Optional[int] = None
+        output_zoom: Optional[int] = None,
+        embedder_cache_key: Optional[str] = None,
     ) -> None:
         """
         Initialize an embedding aggregation layer.
@@ -286,11 +292,12 @@ class EmbLayer(nn.Module):
          
         super().__init__()
 
-        aggregation = layer_confs_emb.get("aggregation","shift_scale")
+        aggregation = emb_aggregation
         self.embedder = embedder
         self.field_tokenizer: Optional[Tokenizer] = field_tokenizer
         self.spatial_dim_count: int = spatial_dim_count
         self.output_zoom: Optional[int] = output_zoom
+        self.embedder_cache_key: Optional[str] = embedder_cache_key
 
         if not isinstance(out_features, list):
             out_features_ = [out_features]
@@ -308,21 +315,69 @@ class EmbLayer(nn.Module):
             self.get_emb_fcn = self.get_emb_and_tokenize
 
         if aggregation == 'shift_scale':
-            layer_confs_emb['ranks'] = layer_confs_emb.get('ranks', [None]*(len(in_features) + 1)) + [None]
-
-            self.embedding_layer: nn.Module = get_layer([*in_features, self.embedder.get_out_channels, 1], [*out_features_, 2], layer_confs=layer_confs_emb)
+            ranks = emb_ranks if emb_ranks is not None else ([None] * (len(in_features) + 2))
+            self.embedding_layer = get_layer(
+                [*in_features, self.embedder.get_out_channels, 1],
+                [*out_features_, 2],
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode,
+            )
             self.forward_fcn = self.forward_w_shift_scale
 
+        elif aggregation == 'shift_scale_gamma':
+            ranks = emb_ranks if emb_ranks is not None else ([None] * (len(in_features) + 2))
+            self.embedding_layer = get_layer(
+                [*in_features, self.embedder.get_out_channels, 1],
+                [*out_features_, 2],
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode,
+            )
+            self.forward_fcn = self.forward_w_shift_scale_gamma
+            self.gamma_shift = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+            self.gamma_scale = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+
+        elif aggregation == 'shift_scale_mlp':
+            ranks = emb_ranks if emb_ranks is not None else ([None] * (len(in_features) + 2))
+            self.embedding_layer = MLP_fac(
+                [*in_features, self.embedder.get_out_channels, 1],
+                [*out_features_, 2],
+                mult=1,
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode
+            ) 
+            self.forward_fcn = self.forward_w_shift_scale
+        
+        elif aggregation == 'shift_scale_mlp_gamma':
+            ranks = emb_ranks if emb_ranks is not None else ([None] * (len(in_features) + 2))
+            self.embedding_layer = MLP_fac(
+                [*in_features, self.embedder.get_out_channels, 1],
+                [*out_features_, 2],
+                mult=1,
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode
+            ) 
+            self.forward_fcn = self.forward_w_shift_scale_gamma
+            self.gamma_shift = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+            self.gamma_scale = nn.Parameter(torch.zeros(out_features_) * 1e-12, requires_grad=True)
+
         elif aggregation == 'shift':
-            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], layer_confs=layer_confs_emb)
+            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_shift
         
         elif aggregation == 'scale':
-            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], layer_confs=layer_confs_emb)
+            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_scale
 
         elif aggregation == 'concat':
-            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], layer_confs=layer_confs_emb)
+            self.embedding_layer = get_layer([*in_features, self.embedder.get_out_channels], [*out_features_], ranks=emb_ranks, n_variables=n_variables, indexed_dims=indexed_dims, fac_mode=fac_mode)
             self.forward_fcn = self.forward_w_concat
 
         self.aggregation: str = aggregation
@@ -335,7 +390,16 @@ class EmbLayer(nn.Module):
         :param sample_configs: Sampling configuration dictionary.
         :return: Embedded tensor shaped like ``(b, v, t, n, d, c)``.
         """
+        cache = None if emb is None else emb.get(GLOBAL_EMBEDDER_CACHE_KEY)
+        if self.embedder_cache_key is not None and isinstance(cache, Mapping) and self.embedder_cache_key in cache:
+            return cache[self.embedder_cache_key]
+
         emb_ = self.embedder(emb, sample_configs, output_zoom=self.output_zoom)
+        if self.embedder_cache_key is not None and emb is not None:
+            if not isinstance(cache, dict):
+                cache = {}
+                emb[GLOBAL_EMBEDDER_CACHE_KEY] = cache
+            cache[self.embedder_cache_key] = emb_
         return emb_
     
     def get_emb_and_tokenize(self, emb: Dict[str, Any], sample_configs: Dict[str, Any] = {}) -> torch.Tensor:
@@ -430,6 +494,26 @@ class EmbLayer(nn.Module):
 
         return x
 
+    def forward_w_shift_scale_gamma(self, x: torch.Tensor, emb: Optional[Dict[str, Any]] = None, sample_configs: Dict[str, Any] = {}) -> torch.Tensor:
+        """
+        Apply scale and shift embedding update.
+
+        :param x: Input tensor of shape ``(b, v, t, n, d, f)``.
+        :param emb: Optional embedding dictionary.
+        :param sample_configs: Sampling configuration dictionary.
+        :return: Updated tensor of shape ``(b, v, t, n, d, f)``.
+        """
+        
+        emb_ = self.get_emb_fcn(emb, sample_configs)
+        scale, shift = self.embedding_layer(emb_, sample_configs=sample_configs, emb=emb).chunk(2, dim=-1)
+
+        scale = scale.squeeze(dim=-1)
+        shift = shift.squeeze(dim=-1)
+
+        x = x * (scale * self.gamma_scale + 1) + shift * self.gamma_shift
+
+        return x
+
     def forward(self, x: torch.Tensor, emb: Dict[str, Any], sample_configs: Dict[str, Any] = {}) -> torch.Tensor:
         """
         Apply the configured embedding aggregation.
@@ -450,12 +534,19 @@ class LinEmbLayer(nn.Module):
         out_features: Union[List[int], int],
         layer_norm: bool = False,
         identity_if_equal: bool = False,
-        layer_confs: Dict[str, Any] = {},
-        layer_confs_emb: Dict[str, Any] = {},
+        ranks: Optional[List[Optional[int]]] = None,
+        emb_ranks: Optional[List[Optional[int]]] = None,
+        n_variables: int = 1,
+        n_variable_norm: int = 1,
+        indexed_dims: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+        indexed_dims_norm: Optional[Mapping[Union[str, int], Mapping[str, Any]]] = None,
+        fac_mode: str = "Tucker",
+        emb_aggregation: str = "shift_scale",
         embedder: Optional[Any] = None,
         field_tokenizer: Optional[Tokenizer] = None,
         output_zoom: Optional[int] = None,
-        spatial_dim_count: int = 1
+        spatial_dim_count: int = 1,
+        embedder_cache_key: Optional[str] = None,
     ) -> None:
         """
         Initialize a linear embedding layer with optional conditioning.
@@ -496,12 +587,17 @@ class LinEmbLayer(nn.Module):
             
             self.embedding_layer: nn.Module = EmbLayer(out_features, 
                                             embedder=embedder,
-                                            layer_confs_emb=layer_confs_emb,
+                                            emb_aggregation=emb_aggregation,
+                                            emb_ranks=emb_ranks,
+                                            n_variables=n_variables,
+                                            indexed_dims=indexed_dims,
+                                            fac_mode=fac_mode,
                                             spatial_dim_count=spatial_dim_count,
                                             field_tokenizer = field_tokenizer,
-                                            output_zoom=output_zoom)
+                                            output_zoom=output_zoom,
+                                            embedder_cache_key=embedder_cache_key)
            
-            concat = layer_confs_emb.get('aggregation','sum') == 'concat'
+            concat = emb_aggregation == 'concat'
 
             self.out_features = self.embedding_layer.out_features + out_features if concat else out_features
 
@@ -509,14 +605,26 @@ class LinEmbLayer(nn.Module):
             self.embedding_layer = IdentityLayer()
 
         if layer_norm:
-            self.layer_norm: nn.Module = LayerNorm(out_features_, elementwise_affine=True, n_variables=layer_confs.get("n_variables",1))
+            self.layer_norm = LayerNorm(
+                out_features_,
+                elementwise_affine=True,
+                n_variables=n_variable_norm,
+                indexed_dims=indexed_dims_norm,
+            )
         else:
             self.layer_norm = IdentityLayer()
 
         if identity_if_equal and (torch.tensor(in_features_)-torch.tensor(out_features_)==0).all():
             self.layer: nn.Module = IdentityLayer()
         else:
-            self.layer = get_layer(in_features_, out_features_, layer_confs=layer_confs)
+            self.layer = get_layer(
+                in_features_,
+                out_features_,
+                ranks=ranks,
+                n_variables=n_variables,
+                indexed_dims=indexed_dims,
+                fac_mode=fac_mode,
+            )
 
 
     def forward(

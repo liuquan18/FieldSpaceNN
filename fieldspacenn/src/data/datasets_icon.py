@@ -7,7 +7,7 @@ import xarray as xr
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from .datasets_base import BaseDataset
-from ..modules.grids.grid_utils import hierarchical_zoom_distance_map
+from ..modules.grids.grid_utils import icon_get_parent_index, identity_grid_mapping
 
 
 class ICONLoader(BaseDataset):
@@ -18,6 +18,7 @@ class ICONLoader(BaseDataset):
         sampling_zooms_collate: Optional[Mapping[int, Mapping[str, Any]]] = None,
         sampling_times_emb: Optional[Mapping[str, Any]] = None,
         sampling_zooms_target: Mapping[int, Mapping[str, Any]] = None,
+        grid_files: Optional[Mapping[int, str]] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -37,6 +38,13 @@ class ICONLoader(BaseDataset):
             ``n_past_ts`` and ``n_future_ts``.
         :param sampling_zooms_target: Optional target sampling configuration keyed
             by zoom level (defaults to ``sampling_zooms``).
+        :param grid_files: Optional mapping from zoom level to the path of the
+            corresponding ICON *grid* file (containing ``clon``/``clat`` and,
+            ideally, ``child_cell_index``/``parent_cell_index``), covering
+            every integer zoom level between the coarsest sampled patch zoom
+            and the finest sampled zoom. When provided, it is used to derive
+            the exact quad-tree parent-child hierarchy for patch sampling
+            instead of assuming a Healpix-like contiguous cell ordering.
         :param kwargs: Additional arguments forwarded to the base dataset initializer.
         :return: None.
         """
@@ -50,6 +58,8 @@ class ICONLoader(BaseDataset):
             sampling_times_emb = OmegaConf.to_container(sampling_times_emb, resolve=True)
         if isinstance(sampling_zooms_target, (DictConfig, ListConfig)):
             sampling_zooms_target = OmegaConf.to_container(sampling_zooms_target, resolve=True)
+        if isinstance(grid_files, (DictConfig, ListConfig)):
+            grid_files = OmegaConf.to_container(grid_files, resolve=True)
 
         self.sampling_zooms: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms)
         self.sampling_zooms_collate: Optional[Mapping[int, Mapping[str, Any]]] = copy.deepcopy(
@@ -61,6 +71,9 @@ class ICONLoader(BaseDataset):
             self.sampling_zooms_target: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms)
         else:
             self.sampling_zooms_target: Mapping[int, Mapping[str, Any]] = copy.deepcopy(sampling_zooms_target)
+
+        if grid_files is not None:
+            grid_files = {int(z): path for z, path in grid_files.items()}
 
         # Build patch indices per zoom from each zoom's own ICON native grid
         # file. The number of cells (and thus the zoom/refinement level) is
@@ -91,11 +104,20 @@ class ICONLoader(BaseDataset):
 
             if sampling['zoom_patch_sample'] == -1:
                 self.indices[zoom] = np.arange(npix).reshape(1, -1)
+            elif grid_files is not None:
+                self.indices[zoom] = _build_patch_indices_from_hierarchy(
+                    zoom, sampling['zoom_patch_sample'], npix, grid_files
+                )
             else:
+                # Fallback: assumes the on-disk cell ordering already follows
+                # the recursive quad-tree bisection order (true for some, but
+                # not all, ICON grid generation pipelines). Prefer passing
+                # `grid_files` so the exact hierarchy from the grid file(s)
+                # is used instead of this assumption.
                 n_pts_patch = 4 ** (zoom - sampling['zoom_patch_sample'])
                 self.indices[zoom] = np.arange(npix).reshape(-1, n_pts_patch)
 
-        super().__init__(mapping_fcn=hierarchical_zoom_distance_map, **kwargs)
+        super().__init__(mapping_fcn=identity_grid_mapping, **kwargs)
 
     def get_indices_from_patch_idx(self, zoom: int, patch_idx: int) -> np.ndarray:
         """
@@ -106,3 +128,55 @@ class ICONLoader(BaseDataset):
         :return: Column vector of pixel indices for the selected patch with shape ``(n,)``.
         """
         return self.indices[int(zoom)][patch_idx].reshape(-1)
+
+
+def _build_patch_indices_from_hierarchy(
+    zoom: int,
+    zoom_patch_sample: int,
+    npix: int,
+    grid_files: Mapping[int, str],
+) -> np.ndarray:
+    """
+    Group a zoom level's cells into patches using the real ICON parent-child hierarchy.
+
+    Chains ``icon_get_parent_index`` through every intermediate integer zoom
+    level between ``zoom`` and ``zoom_patch_sample`` (all of which must be
+    present in ``grid_files``) to find each cell's ancestor at
+    ``zoom_patch_sample``, then groups cells sharing the same ancestor into a
+    patch.
+
+    :param zoom: Zoom level of the cells being grouped into patches.
+    :param zoom_patch_sample: Target (coarser) zoom level defining the patches.
+    :param npix: Number of cells at ``zoom``.
+    :param grid_files: Mapping from zoom level to ICON grid file path,
+        covering every integer zoom from ``zoom_patch_sample`` to ``zoom``.
+    :return: Index array of shape ``(n_patches, patch_size)``.
+    """
+    missing = [z for z in range(zoom_patch_sample, zoom + 1) if z not in grid_files]
+    assert not missing, (
+        f"`grid_files` must include every zoom level from {zoom_patch_sample} to "
+        f"{zoom} to resolve the ICON parent-child hierarchy; missing {missing}."
+    )
+
+    ancestor = np.arange(npix)
+    datasets = {z: xr.open_dataset(grid_files[z]) for z in range(zoom_patch_sample, zoom + 1)}
+    try:
+        for z in range(zoom, zoom_patch_sample, -1):
+            parent_index = icon_get_parent_index(datasets[z], datasets[z - 1]).numpy()
+            ancestor = parent_index[ancestor]
+    finally:
+        for ds in datasets.values():
+            ds.close()
+
+    patch_size = 4 ** (zoom - zoom_patch_sample)
+    order = np.argsort(ancestor, kind="stable")
+    ancestor_sorted = ancestor[order]
+
+    _, counts = np.unique(ancestor_sorted, return_counts=True)
+    assert (counts == patch_size).all(), (
+        "The ICON grid hierarchy does not produce uniformly sized patches "
+        f"(expected {patch_size} cells per patch); the grid may include "
+        "local refinement/nesting that this uniform patch sampler does not support."
+    )
+
+    return order.reshape(-1, patch_size)

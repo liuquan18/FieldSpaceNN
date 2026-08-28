@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import healpy as hp
 import numpy as np
@@ -885,55 +885,6 @@ def get_matching_time_patch(
             return x_h
         else:
             return x_h[0]
-        
-def healpix_get_adjacent_cell_indices(zoom: int):
-    """
-    Get neighbor indices for a Healpix grid.
-
-    :param zoom: Healpix zoom level.
-    :return: Tuple of (adjacency, duplicates_mask), both shape ``(npix, 9)``.
-    """
-
-    nside = 2**zoom
-    npix = hp.nside2npix(nside)
-
-    adjc = torch.tensor(hp.get_all_neighbours(nside, np.arange(npix),nest=True)).transpose(0,1)
-
-    adjc = torch.concat((torch.arange(npix).view(-1,1),adjc),dim=-1)
-    duplicates = adjc == -1
-
-    c,n = torch.where(duplicates)
-    adjc[c,n] = adjc[c,0]
-    return adjc, duplicates
-
-def healpix_pixel_lonlat_torch(zoom: int, return_numpy: bool = False):
-    """
-    Get Healpix pixel coordinates (lon, lat) for a zoom level.
-
-    :param zoom: Healpix zoom level.
-    :param return_numpy: Whether to return a NumPy array.
-    :return: Coordinate array of shape ``(npix, 2)``.
-    """
-    nside = 2**zoom
-
-    npix = hp.nside2npix(nside)  # Total number of pixels
-
-    # Get pixel indices as a PyTorch tensor
-    pixel_indices = torch.arange(npix, dtype=torch.long)
-
-    # Get theta (colatitude) and phi (longitude) for each pixel using healpy
-    theta, phi = hp.pix2ang(nside, pixel_indices.numpy(), nest=True)
-
-    # Convert theta and phi to PyTorch tensors
-    theta_tensor = torch.tensor(theta, dtype=torch.float32) - 0.5 * torch.pi
-    phi_tensor = torch.tensor(phi, dtype=torch.float32) - torch.pi
-
-    coords = torch.stack([phi_tensor, theta_tensor], dim=-1).float()
-
-    if return_numpy:
-        return coords.numpy()
-    else:
-        return coords
 
 def healpix_grid_to_mgrid(zoom_max: int = 10, nh: int = 1):
     """
@@ -960,6 +911,75 @@ def healpix_grid_to_mgrid(zoom_max: int = 10, nh: int = 1):
         grids.append(grid_lvl)
 
     return grids
+
+
+def icon_get_adjacent_cell_indices(ds: xr.Dataset):
+    """
+    Get neighbor indices for an ICON native (triangular) grid.
+
+    Uses the ``neighbor_cell_index`` variable that ships with every ICON grid
+    file. It is 1-based and has shape ``(3, ncells)`` (up to 3 direct
+    neighbors per triangular cell); missing neighbors (e.g. at a limited-area
+    boundary) are encoded as 0 or a negative value.
+
+    :param ds: Xarray Dataset of the ICON grid file (containing
+        ``neighbor_cell_index``).
+    :return: Tuple of (adjacency, duplicates_mask), both shape ``(ncells, 4)``,
+        where column 0 is the cell itself followed by up to 3 neighbors.
+    """
+    assert "neighbor_cell_index" in ds.variables, (
+        "`neighbor_cell_index` was not found in the ICON grid file; "
+        "it is required to build the cell adjacency."
+    )
+
+    nb = ds["neighbor_cell_index"].values
+    if nb.shape[0] == 3 and nb.shape[-1] != 3:
+        nb = nb.T
+
+    npix = nb.shape[0]
+    # ICON grid files use 1-based, Fortran-style indexing; missing neighbors
+    # are encoded as 0 (or occasionally -1 for LAM boundary cells).
+    nb = nb.astype(np.int64) - 1
+
+    adjc = torch.tensor(np.concatenate((np.arange(npix).reshape(-1, 1), nb), axis=-1))
+    duplicates = (adjc < 0) | (adjc >= npix)
+
+    c, n = torch.where(duplicates)
+    adjc[c, n] = adjc[c, 0]
+
+    return adjc, duplicates
+
+
+def icon_grid_to_mgrid(grid_files: Mapping[int, str]):
+    """
+    Build a list of ICON native-grid levels with coordinates and adjacency.
+
+    Unlike Healpix, ICON refinement levels (``R*B*``) do not follow an
+    analytic pixel-count formula, so each zoom level requires its own grid
+    file (containing at least ``clon``/``clat`` and ``neighbor_cell_index``).
+
+    :param grid_files: Mapping from zoom level to the path of the
+        corresponding ICON grid file.
+    :return: List of grid dicts with "coords", "adjc", "adjc_mask", and "zoom",
+        sorted by ascending zoom.
+    """
+    grids = []
+
+    for zoom in sorted(int(z) for z in grid_files.keys()):
+        with xr.open_dataset(grid_files[zoom]) as ds:
+            adjc, adjc_mask = icon_get_adjacent_cell_indices(ds)
+            coords = get_coords_as_tensor(ds, grid_type="cell")
+
+        grid_lvl = {
+            "coords": coords,
+            "adjc": adjc,
+            "adjc_mask": adjc_mask,
+            "zoom": zoom,
+        }
+        grids.append(grid_lvl)
+
+    return grids
+
 
 def encode_zooms(
     x_zooms: Dict[int, torch.Tensor],

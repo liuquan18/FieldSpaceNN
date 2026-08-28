@@ -234,17 +234,29 @@ class GridLayer(nn.Module):
         self.register_buffer("coordinates", coordinates, persistent=False)
         self.coordinates: torch.Tensor
         
-        if zoom >= 1:
-            # Propagate missing assignments for polar discontinuities.
-            for k in [2,6]:
-                i_shift, i_target = propagate_assignments(adjc, adjc_mask==False, coordinates, nh_k=k)
-                if len(i_shift) > 0:
-                    adjc[i_shift, k] = i_target 
-        
-        for k in [1,3,4,5,7,8]:
-            # Fill missing adjacency entries with a consistent fallback direction.
-            c = torch.where(adjc_mask[:,k])[0]
-            adjc[c,k] = k -1 if k>1 else 8
+        if adjc.shape[-1] == 9:
+            # The 8-directional (N/S/E/W plus diagonals) fixups below assume the
+            # 9-column (self + 8 neighbors) Healpix adjacency layout and are not
+            # applicable to grids with a different neighbor count (e.g. ICON's
+            # triangular cells, which have at most 3 neighbors).
+            if zoom >= 1:
+                # Propagate missing assignments for polar discontinuities.
+                for k in [2,6]:
+                    i_shift, i_target = propagate_assignments(adjc, adjc_mask==False, coordinates, nh_k=k)
+                    if len(i_shift) > 0:
+                        adjc[i_shift, k] = i_target 
+
+            for k in [1,3,4,5,7,8]:
+                # Fill missing adjacency entries with a consistent fallback direction.
+                c = torch.where(adjc_mask[:,k])[0]
+                adjc[c,k] = k -1 if k>1 else 8
+        else:
+            # Generic fallback for grids with an arbitrary neighbor count
+            # (e.g. ICON): replace any still-invalid adjacency entries with the
+            # cell's own index, matching the self-index convention used by
+            # the Healpix path (column 0 is always the cell itself).
+            c, n = torch.where(adjc_mask)
+            adjc[c, n] = adjc[c, 0]
 
         self.register_buffer("adjc", adjc, persistent=False)
         self.adjc: torch.Tensor

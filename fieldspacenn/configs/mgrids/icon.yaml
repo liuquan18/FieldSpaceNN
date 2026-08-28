@@ -1,0 +1,10 @@
+_target_: fieldspacenn.src.modules.grids.grid_utils.icon_grid_to_mgrid
+# Mapping from zoom level to the corresponding ICON native grid file.
+# Unlike Healpix, ICON refinement levels (R*B*) don't follow an analytic
+# pixel-count formula, so every zoom level needs its own grid file
+# (containing `clon`/`clat` and `neighbor_cell_index`), e.g. an R2B04 grid.
+# Fill in real paths once test data (e.g. R2B4) is available.
+grid_files:
+  3: ???
+  5: ???
+  6: ???

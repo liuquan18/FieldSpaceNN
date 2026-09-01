@@ -273,6 +273,7 @@ class BaseDataset(Dataset):
         load_n_samples_time: int = 1,
         target_time_shift: int = 0,
         overwrite_depths: Optional[Sequence[float]] = None,
+        coords_files: Optional[Mapping[int, str]] = None,
     ) -> None:
         """
         Initialize the dataset with sampling, masking, and normalization settings.
@@ -303,9 +304,17 @@ class BaseDataset(Dataset):
         :param target_time_shift: Shift applied to target sample centers relative to source centers.
         :param overwrite_depths: Optional replacement values for the vertical ``level``
             coordinate. Applied only when the loaded variables expose a ``level`` dimension.
+        :param coords_files: Optional mapping from zoom level to a file path from which
+            cell/vertex/edge coordinates should be read instead of the zoom's data source
+            file(s). Needed for grids (e.g. ICON native output) whose data files do not
+            themselves carry spatial coordinate variables.
         :return: None.
         """
         super(BaseDataset, self).__init__()
+
+        self.coords_files: Optional[Dict[int, str]] = (
+            {int(z): path for z, path in coords_files.items()} if coords_files is not None else None
+        )
 
         if not hasattr(self, "sampling_zooms_target") or self.sampling_zooms_target is None:
             self.sampling_zooms_target = copy.deepcopy(self.sampling_zooms)
@@ -515,9 +524,16 @@ class BaseDataset(Dataset):
         self.mapping: Dict[int, Dict[Any, Any]] = {}
         if self.single_source:
             # Single-source: build a shared mapping at the highest zoom and reuse across zooms.
-            coords = [
-                get_coords_as_tensor(ds, grid_type=grid_type) for grid_type in self.grid_types
-            ]
+            hr_zoom = max(self.zooms)
+            if self.coords_files is not None and hr_zoom in self.coords_files:
+                with xr.open_dataset(self.coords_files[hr_zoom]) as coords_ds:
+                    coords = [
+                        get_coords_as_tensor(coords_ds, grid_type=grid_type) for grid_type in self.grid_types
+                    ]
+            else:
+                coords = [
+                    get_coords_as_tensor(ds, grid_type=grid_type) for grid_type in self.grid_types
+                ]
             mapping_hr = dict(
                 zip(self.grid_types, [mapping_fcn(coords_, max(self.zooms))[max(self.zooms)] for coords_ in coords])
             )
@@ -526,8 +542,12 @@ class BaseDataset(Dataset):
             for zoom in self.zooms:
                 # Multi-source: build a per-zoom mapping using that zoom's grid.
                 mapping_grid_type = {}
+                if self.coords_files is not None and zoom in self.coords_files:
+                    coords_file = self.coords_files[zoom]
+                else:
+                    coords_file = self.data_dict['source'][zoom]['files'][0]
                 for grid_type in self.grid_types:
-                    with xr.open_dataset(self.data_dict['source'][zoom]['files'][0]) as ds:
+                    with xr.open_dataset(coords_file) as ds:
                         coords = get_coords_as_tensor(ds, grid_type=grid_type)
                         mapping_grid_type[grid_type] = mapping_fcn(coords, zoom)[zoom]
                 self.mapping[zoom] = mapping_grid_type
@@ -749,9 +769,20 @@ class BaseDataset(Dataset):
                 for k, variable in enumerate(variables):
                     data_g[k] = self.var_normalizers[zoom][variable].normalize(data_g[k])
 
-            if 'level' not in ds_variables.dims:
+            # Determine whether the source variable already carries a vertical
+            # (non-spatial, non-time) dimension. This is not always named
+            # 'level' (e.g. ICON near-surface diagnostics like u_10m use a
+            # singleton 'height' dim), so detect it generically as any dim
+            # besides 'variable'/'time' and the trailing spatial dim. Read
+            # dims from the DataArray (not the Dataset-level mapping) to
+            # rely on its guaranteed per-variable dimension order.
+            var_dims = ds_variables[variables[0]].dims
+            non_var_time_dims = [d for d in var_dims if d not in ('variable', 'time')]
+            vertical_dims = non_var_time_dims[:-1] if non_var_time_dims else []
+
+            if not vertical_dims:
                 data_g = data_g.unsqueeze(dim=2)
-            else:
+            elif 'level' in vertical_dims:
                 depth_values = self._resolve_depth_values(ds_variables["level"].values)
 
             data_g = data_g.transpose(2,3)
@@ -812,6 +843,13 @@ class BaseDataset(Dataset):
         time_coord = ds["time"]
         units = time_coord.attrs.get("units") or time_coord.encoding.get("units")
         calendar = time_coord.attrs.get("calendar") or time_coord.encoding.get("calendar")
+
+        if units is not None and "day as" in str(units).lower():
+            # ICON/CDI convention: units like "day as %Y%m%d.%f", where values
+            # encode the date as an 8-digit YYYYMMDD integer part plus a
+            # fractional day (e.g. 19791201.041666 = 1979-12-01 01:00).
+            return self._decode_icon_day_as_ymd_time(time_values)
+
         if units is not None:
             return decode_cf_datetime(time_values, units=units, calendar=calendar)
 
@@ -819,6 +857,24 @@ class BaseDataset(Dataset):
             return pd.to_datetime(time_values, unit="s", utc=True).tz_localize(None).to_numpy()
 
         raise ValueError("Could not decode dataset time coordinate; missing CF units and non-datetime dtype.")
+
+    @staticmethod
+    def _decode_icon_day_as_ymd_time(time_values: np.ndarray) -> np.ndarray:
+        """
+        Decode ICON/CDI's ``"day as %Y%m%d.%f"`` time encoding into datetime64 values.
+
+        :param time_values: Array of floats shaped like ``YYYYMMDD.fraction``,
+            where the integer part is an 8-digit date and the fractional part
+            is the fraction of that day elapsed.
+        :return: NumPy array of ``datetime64[ns]`` values.
+        """
+        time_values = np.asarray(time_values, dtype=np.float64)
+        date_int = np.floor(time_values).astype(np.int64)
+        day_fraction = time_values - date_int
+
+        date_strings = np.char.mod("%08d", date_int)
+        dates = pd.to_datetime(date_strings, format="%Y%m%d")
+        return (dates + pd.to_timedelta(day_fraction, unit="D")).to_numpy()
 
     def _get_time_progress(self, ds: xr.Dataset) -> torch.Tensor:
         """

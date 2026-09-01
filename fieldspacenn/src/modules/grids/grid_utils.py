@@ -76,6 +76,25 @@ def get_coords_as_tensor(
     if lon in ds.variables and lat in ds.variables:
         lons_values = ds[lon].values
         lats_values = ds[lat].values
+    elif grid_type == 'cell' and 'lon_cell_centre' in ds.variables and 'lat_cell_centre' in ds.variables:
+        # ICON grid-generator files (e.g. Earth_IcosS_*.nc) name cell-center
+        # coordinates 'lon_cell_centre'/'lat_cell_centre' instead of 'clon'/'clat'.
+        lons_values = ds['lon_cell_centre'].values.astype(np.float64)
+        lats_values = ds['lat_cell_centre'].values.astype(np.float64)
+
+        # These may be stored in degrees or radians depending on the grid
+        # generator; detect degrees either via a 'units' attribute or,
+        # failing that, via value range, and normalize to radians.
+        lon_units = str(ds['lon_cell_centre'].attrs.get('units', '')).lower()
+        lat_units = str(ds['lat_cell_centre'].attrs.get('units', '')).lower()
+        is_degree_input = 'degree' in lon_units or 'degree' in lat_units
+        if not lon_units and not lat_units:
+            max_abs_lon = float(np.nanmax(np.abs(lons_values)))
+            max_abs_lat = float(np.nanmax(np.abs(lats_values)))
+            is_degree_input = max_abs_lon > (2 * np.pi + 1e-6) or max_abs_lat > (0.5 * np.pi + 1e-6)
+        if is_degree_input:
+            lons_values = np.deg2rad(lons_values)
+            lats_values = np.deg2rad(lats_values)
     else:
         # Fallback to Healpix coordinates when explicit cell coordinates are absent.
         if grid_type == 'cell':
@@ -89,6 +108,18 @@ def get_coords_as_tensor(
                 zoom = get_zoom_from_npix(npix)
                 if zoom is not None:
                     return healpix_pixel_lonlat_torch(zoom, return_numpy=target == 'numpy')
+
+                # `npix` does not correspond to any valid Healpix pixel count
+                # (e.g. ICON's ncells = 5 * 4**zoom). Rather than silently
+                # returning None (which surfaces as a confusing crash much
+                # later), fail loudly here.
+                raise ValueError(
+                    f"Could not resolve cell coordinates: no '{lon}'/'{lat}' "
+                    f"(or 'lon_cell_centre'/'lat_cell_centre') variables found, "
+                    f"and npix={npix} is not a valid Healpix pixel count. "
+                    "For ICON native grids, pass the grid file (containing "
+                    "cell coordinates) rather than a data file that lacks them."
+                )
             return None
 
         # For regular lon/lat-style grids, synthesize coordinates from dimensions

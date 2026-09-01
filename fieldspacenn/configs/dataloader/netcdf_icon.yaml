@@ -9,12 +9,13 @@ dataset:
   apply_diff: true
   mask_ts_mode: 'zero'
   load_n_samples_time: 2
+  # Reuse the same per-zoom grid file paths configured in `mgrids/icon.yaml`
+  # so cell coordinates are resolved from the grid files (which carry
+  # `clon`/`clat` or `lon_cell_centre`/`lat_cell_centre`) rather than from
+  # the data files, which for real ICON output typically carry no
+  # coordinate variables at all.
+  grid_files: ${mgrids.grid_files}
   sampling_zooms:
-    3:
-      n_past_ts: 1
-      n_future_ts: 1
-      zoom_patch_sample: -1
-      mask_n_last_ts: 1
     5:
       n_past_ts: 1
       n_future_ts: 1

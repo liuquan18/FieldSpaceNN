@@ -1,0 +1,19 @@
+defaults:
+  - trainer: trainer
+  - logger: wandb
+  - model: mg_transformer
+  - mgrids: icon
+  - data_zooms: icon
+  - data_variables: icon
+  - data_split: default
+  - dataloader: netcdf_icon
+  - embedding: default
+  - hydra: default
+  - _self_
+
+ckpt_path: null
+
+run_name: mg_transformer_icon
+config_name: default
+project_name: test
+run_dir: ../..

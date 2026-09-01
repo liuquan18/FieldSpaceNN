@@ -117,7 +117,7 @@ class ICONLoader(BaseDataset):
                 n_pts_patch = 4 ** (zoom - sampling['zoom_patch_sample'])
                 self.indices[zoom] = np.arange(npix).reshape(-1, n_pts_patch)
 
-        super().__init__(mapping_fcn=identity_grid_mapping, **kwargs)
+        super().__init__(mapping_fcn=identity_grid_mapping, coords_files=grid_files, **kwargs)
 
     def get_indices_from_patch_idx(self, zoom: int, patch_idx: int) -> np.ndarray:
         """

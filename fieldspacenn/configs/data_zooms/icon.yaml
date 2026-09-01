@@ -1,0 +1,6 @@
+5:
+  files:
+    - ??? # e.g. /path/to/nwp_r2b3_atm_2d_ml_*.nc (R2B03 native output, 5120 cells)
+6:
+  files:
+    - ??? # e.g. /path/to/nwp_r2b4_atm_2d_ml_*.nc (R2B04 native output, 20480 cells)

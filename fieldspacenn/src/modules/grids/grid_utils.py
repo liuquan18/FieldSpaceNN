@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import healpy as hp
 import numpy as np
@@ -76,6 +76,25 @@ def get_coords_as_tensor(
     if lon in ds.variables and lat in ds.variables:
         lons_values = ds[lon].values
         lats_values = ds[lat].values
+    elif grid_type == 'cell' and 'lon_cell_centre' in ds.variables and 'lat_cell_centre' in ds.variables:
+        # ICON grid-generator files (e.g. Earth_IcosS_*.nc) name cell-center
+        # coordinates 'lon_cell_centre'/'lat_cell_centre' instead of 'clon'/'clat'.
+        lons_values = ds['lon_cell_centre'].values.astype(np.float64)
+        lats_values = ds['lat_cell_centre'].values.astype(np.float64)
+
+        # These may be stored in degrees or radians depending on the grid
+        # generator; detect degrees either via a 'units' attribute or,
+        # failing that, via value range, and normalize to radians.
+        lon_units = str(ds['lon_cell_centre'].attrs.get('units', '')).lower()
+        lat_units = str(ds['lat_cell_centre'].attrs.get('units', '')).lower()
+        is_degree_input = 'degree' in lon_units or 'degree' in lat_units
+        if not lon_units and not lat_units:
+            max_abs_lon = float(np.nanmax(np.abs(lons_values)))
+            max_abs_lat = float(np.nanmax(np.abs(lats_values)))
+            is_degree_input = max_abs_lon > (2 * np.pi + 1e-6) or max_abs_lat > (0.5 * np.pi + 1e-6)
+        if is_degree_input:
+            lons_values = np.deg2rad(lons_values)
+            lats_values = np.deg2rad(lats_values)
     else:
         # Fallback to Healpix coordinates when explicit cell coordinates are absent.
         if grid_type == 'cell':
@@ -89,6 +108,18 @@ def get_coords_as_tensor(
                 zoom = get_zoom_from_npix(npix)
                 if zoom is not None:
                     return healpix_pixel_lonlat_torch(zoom, return_numpy=target == 'numpy')
+
+                # `npix` does not correspond to any valid Healpix pixel count
+                # (e.g. ICON's ncells = 5 * 4**zoom). Rather than silently
+                # returning None (which surfaces as a confusing crash much
+                # later), fail loudly here.
+                raise ValueError(
+                    f"Could not resolve cell coordinates: no '{lon}'/'{lat}' "
+                    f"(or 'lon_cell_centre'/'lat_cell_centre') variables found, "
+                    f"and npix={npix} is not a valid Healpix pixel count. "
+                    "For ICON native grids, pass the grid file (containing "
+                    "cell coordinates) rather than a data file that lacks them."
+                )
             return None
 
         # For regular lon/lat-style grids, synthesize coordinates from dimensions
@@ -565,6 +596,35 @@ def regular_to_healpix_nearest_mapping(
         "resolution": torch.tensor(resolution, dtype=torch.float32),
     }
 
+def identity_grid_mapping(input_coords: torch.Tensor, max_zoom: int):
+    """
+    Build a trivial identity mapping for native (non-regridded) grid loaders.
+
+    Some grid types (e.g. ICON's native triangular mesh) are consumed
+    directly on their own cells, with no nearest-neighbor regridding step
+    involved. ``hierarchical_zoom_distance_map`` is unsuitable here since it
+    always measures distances to analytic Healpix pixel centers, which would
+    silently snap native-grid cells onto the wrong (Healpix) geometry. This
+    function instead returns each cell mapped onto itself, matching the
+    ``mapping_fcn`` interface expected by :class:`BaseDataset`.
+
+    :param input_coords: Coordinate tensor of shape ``(n, 2)`` (unused beyond
+        determining ``n``, kept for interface parity with ``mapping_fcn``).
+    :param max_zoom: Zoom level to key the returned mapping dict with.
+    :return: Dict ``{max_zoom: {"indices": (n, 1), "distances": (n, 1), "resolution": ()}}``.
+    """
+    n = input_coords.shape[0]
+    indices = torch.arange(n, dtype=torch.long).view(-1, 1)
+    distances = torch.zeros((n, 1), dtype=torch.float32)
+
+    return {
+        max_zoom: {
+            "indices": indices,
+            "distances": distances,
+            "resolution": torch.tensor(1.0),
+        }
+    }
+
 def hierarchical_zoom_distance_map(input_coords: torch.Tensor, max_zoom: int):
     """
     Iteratively computes distances between HEALPix cell centers and input_coords across zoom levels.
@@ -885,55 +945,6 @@ def get_matching_time_patch(
             return x_h
         else:
             return x_h[0]
-        
-def healpix_get_adjacent_cell_indices(zoom: int):
-    """
-    Get neighbor indices for a Healpix grid.
-
-    :param zoom: Healpix zoom level.
-    :return: Tuple of (adjacency, duplicates_mask), both shape ``(npix, 9)``.
-    """
-
-    nside = 2**zoom
-    npix = hp.nside2npix(nside)
-
-    adjc = torch.tensor(hp.get_all_neighbours(nside, np.arange(npix),nest=True)).transpose(0,1)
-
-    adjc = torch.concat((torch.arange(npix).view(-1,1),adjc),dim=-1)
-    duplicates = adjc == -1
-
-    c,n = torch.where(duplicates)
-    adjc[c,n] = adjc[c,0]
-    return adjc, duplicates
-
-def healpix_pixel_lonlat_torch(zoom: int, return_numpy: bool = False):
-    """
-    Get Healpix pixel coordinates (lon, lat) for a zoom level.
-
-    :param zoom: Healpix zoom level.
-    :param return_numpy: Whether to return a NumPy array.
-    :return: Coordinate array of shape ``(npix, 2)``.
-    """
-    nside = 2**zoom
-
-    npix = hp.nside2npix(nside)  # Total number of pixels
-
-    # Get pixel indices as a PyTorch tensor
-    pixel_indices = torch.arange(npix, dtype=torch.long)
-
-    # Get theta (colatitude) and phi (longitude) for each pixel using healpy
-    theta, phi = hp.pix2ang(nside, pixel_indices.numpy(), nest=True)
-
-    # Convert theta and phi to PyTorch tensors
-    theta_tensor = torch.tensor(theta, dtype=torch.float32) - 0.5 * torch.pi
-    phi_tensor = torch.tensor(phi, dtype=torch.float32) - torch.pi
-
-    coords = torch.stack([phi_tensor, theta_tensor], dim=-1).float()
-
-    if return_numpy:
-        return coords.numpy()
-    else:
-        return coords
 
 def healpix_grid_to_mgrid(zoom_max: int = 10, nh: int = 1):
     """
@@ -960,6 +971,241 @@ def healpix_grid_to_mgrid(zoom_max: int = 10, nh: int = 1):
         grids.append(grid_lvl)
 
     return grids
+
+
+def icon_get_adjacent_cell_indices(ds: xr.Dataset):
+    """
+    Get neighbor indices for an ICON native (triangular) grid.
+
+    Uses the ``neighbor_cell_index`` variable that ships with every ICON grid
+    file. It is 1-based and has shape ``(3, ncells)`` (up to 3 direct
+    neighbors per triangular cell); missing neighbors (e.g. at a limited-area
+    boundary) are encoded as 0 or a negative value.
+
+    :param ds: Xarray Dataset of the ICON grid file (containing
+        ``neighbor_cell_index``).
+    :return: Tuple of (adjacency, duplicates_mask), both shape ``(ncells, 4)``,
+        where column 0 is the cell itself followed by up to 3 neighbors.
+    """
+    assert "neighbor_cell_index" in ds.variables, (
+        "`neighbor_cell_index` was not found in the ICON grid file; "
+        "it is required to build the cell adjacency."
+    )
+
+    nb = ds["neighbor_cell_index"].values
+    if nb.shape[0] == 3 and nb.shape[-1] != 3:
+        nb = nb.T
+
+    npix = nb.shape[0]
+    # ICON grid files use 1-based, Fortran-style indexing; missing neighbors
+    # are encoded as 0 (or occasionally -1 for LAM boundary cells).
+    nb = nb.astype(np.int64) - 1
+
+    adjc = torch.tensor(np.concatenate((np.arange(npix).reshape(-1, 1), nb), axis=-1))
+    duplicates = (adjc < 0) | (adjc >= npix)
+
+    c, n = torch.where(duplicates)
+    adjc[c, n] = adjc[c, 0]
+
+    return adjc, duplicates
+
+
+def icon_get_parent_index(
+    ds_fine: xr.Dataset,
+    ds_coarse: Optional[xr.Dataset] = None,
+    fine_coords: Optional[torch.Tensor] = None,
+    coarse_coords: Optional[torch.Tensor] = None,
+):
+    """
+    Get the child-to-parent mapping between two consecutive ICON refinement levels.
+
+    ICON's bisection-refined ("R*B*") grids retain, in most standard grid
+    files, an explicit quad-tree link between a coarser mesh and its
+    once-bisected finer mesh. Three strategies are tried, in order of
+    preference:
+
+    1. ``child_cell_index`` on the coarse grid file: shape ``(4, n_coarse)``,
+       1-based, listing the (up to) four fine-grid children of every coarse
+       cell. This is inverted into a per-fine-cell parent index.
+    2. ``parent_cell_index`` directly on the fine grid file: shape
+       ``(n_fine,)``, 1-based. Note this variable is also used by ICON for
+       limited-area (nested) domain-to-parent-domain bookkeeping, which is a
+       different concept from same-mesh quad-tree refinement; only rely on
+       it here if ``child_cell_index`` is unavailable.
+    3. Geometric nearest-neighbor fallback: match every fine-cell center
+       (``clon``/``clat``) to its closest coarse-cell center. This does not
+       require any refinement metadata and works for any pair of nested
+       "R*B*" grids, at the cost of being approximate near cell boundaries.
+
+    :param ds_fine: Xarray Dataset of the finer-resolution ICON grid file.
+    :param ds_coarse: Optional Xarray Dataset of the coarser-resolution ICON
+        grid file (required for the ``child_cell_index`` strategy and the
+        geometric fallback).
+    :param fine_coords: Optional precomputed fine-grid coordinates of shape
+        ``(n_fine, 2)`` (avoids reloading them from ``ds_fine``).
+    :param coarse_coords: Optional precomputed coarse-grid coordinates of
+        shape ``(n_coarse, 2)`` (avoids reloading them from ``ds_coarse``).
+    :return: LongTensor ``parent_index`` of shape ``(n_fine,)`` mapping every
+        fine cell to its parent cell index in the coarse grid.
+    """
+    if ds_coarse is not None and "child_cell_index" in ds_coarse.variables:
+        child = ds_coarse["child_cell_index"].values
+        if child.shape[0] != 4 and child.shape[-1] == 4:
+            child = child.T
+
+        n_fine = int(child.max())
+        parent_index = torch.full((n_fine,), -1, dtype=torch.long)
+        parent_ids = torch.arange(child.shape[1], dtype=torch.long)
+        for k in range(child.shape[0]):
+            child_ids = torch.as_tensor(child[k].astype(np.int64) - 1)
+            valid = child_ids >= 0
+            parent_index[child_ids[valid]] = parent_ids[valid]
+
+        if (parent_index >= 0).all():
+            return parent_index
+
+    if "parent_cell_index" in ds_fine.variables:
+        parent_index = torch.as_tensor(
+            ds_fine["parent_cell_index"].values.astype(np.int64) - 1
+        ).view(-1)
+        if (parent_index >= 0).all():
+            return parent_index
+
+    # Fall back to a geometric nearest-neighbor match between cell centers.
+    assert ds_coarse is not None, (
+        "A geometric parent-child match requires the coarse grid dataset "
+        "when neither `child_cell_index` nor `parent_cell_index` is available."
+    )
+    if fine_coords is None:
+        fine_coords = get_coords_as_tensor(ds_fine, grid_type="cell", target="numpy")
+    else:
+        fine_coords = np.asarray(fine_coords)
+    if coarse_coords is None:
+        coarse_coords = get_coords_as_tensor(ds_coarse, grid_type="cell", target="numpy")
+    else:
+        coarse_coords = np.asarray(coarse_coords)
+
+    tree = cKDTree(coarse_coords)
+    _, parent_index = tree.query(fine_coords, k=1)
+
+    return torch.as_tensor(parent_index, dtype=torch.long)
+
+
+def icon_scale_pool(x: torch.Tensor, parent_index: torch.Tensor, n_parent: int):
+    """
+    Aggregate fine-cell features to their parent cells (scale pooling).
+
+    :param x: Fine-cell feature tensor of shape ``(n_fine, ..., f)``.
+    :param parent_index: LongTensor of shape ``(n_fine,)`` mapping fine cells
+        to parent cell indices, as returned by ``icon_get_parent_index``.
+    :param n_parent: Number of parent cells.
+    :return: Parent-cell tensor of shape ``(n_parent, ..., f)`` holding the
+        arithmetic mean of each parent's children.
+    """
+    out_shape = (n_parent,) + tuple(x.shape[1:])
+    index = parent_index.view(-1, *([1] * (x.dim() - 1))).expand_as(x)
+
+    x_parent = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
+    x_parent = x_parent.scatter_reduce(0, index, x, reduce="mean", include_self=False)
+
+    return x_parent
+
+
+def icon_scale_unpool(x_parent: torch.Tensor, parent_index: torch.Tensor):
+    """
+    Broadcast parent-cell features back to their fine-grid children (scale unpooling).
+
+    :param x_parent: Parent-cell feature tensor of shape ``(n_parent, ..., f)``.
+    :param parent_index: LongTensor of shape ``(n_fine,)`` mapping fine cells
+        to parent cell indices, as returned by ``icon_get_parent_index``.
+    :return: Fine-cell tensor of shape ``(n_fine, ..., f)``.
+    """
+    return x_parent[parent_index]
+
+
+def scale_constraining_icon(
+    x_child: torch.Tensor,
+    x_parent: torch.Tensor,
+    parent_index: torch.Tensor,
+):
+    """
+    Enforce the zero-mean scale-conservation constraint on an unstructured grid.
+
+    Removes each parent's local mean from its children (leaving zero-mean
+    fine-scale residuals) and adds that mean back onto the parent, so the
+    combined (parent + children) field quantity is conserved.
+
+    :param x_child: Fine-cell feature tensor of shape ``(n_fine, ..., f)``.
+    :param x_parent: Parent-cell feature tensor of shape ``(n_parent, ..., f)``.
+    :param parent_index: LongTensor of shape ``(n_fine,)`` mapping fine cells
+        to parent cell indices, as returned by ``icon_get_parent_index``.
+    :return: Tuple ``(x_child_zero_mean, x_parent_conserved)`` with the same
+        shapes as the inputs.
+    """
+    n_parent = x_parent.shape[0]
+    local_mean = icon_scale_pool(x_child, parent_index, n_parent)
+
+    x_child_zero_mean = x_child - icon_scale_unpool(local_mean, parent_index)
+    x_parent_conserved = x_parent + local_mean
+
+    return x_child_zero_mean, x_parent_conserved
+
+
+def icon_grid_to_mgrid(grid_files: Mapping[int, str]):
+    """
+    Build a list of ICON native-grid levels with coordinates, adjacency, and
+    the cross-zoom (parent-child) hierarchy needed for scale pooling.
+
+    Unlike Healpix, ICON refinement levels (``R*B*``) do not follow an
+    analytic pixel-count formula, so each zoom level requires its own grid
+    file (containing at least ``clon``/``clat`` and ``neighbor_cell_index``,
+    plus ``child_cell_index`` and/or ``parent_cell_index`` where available to
+    resolve the exact quad-tree hierarchy between consecutive zoom levels).
+
+    :param grid_files: Mapping from zoom level to the path of the
+        corresponding ICON grid file.
+    :return: List of grid dicts with "coords", "adjc", "adjc_mask", "zoom",
+        and "parent_index" (``None`` for the coarsest level; otherwise a
+        LongTensor mapping this level's cells to the previous, coarser
+        level's cells), sorted by ascending zoom.
+    """
+    grids = []
+    datasets: Dict[int, xr.Dataset] = {}
+
+    zooms = sorted(int(z) for z in grid_files.keys())
+
+    try:
+        for zoom in zooms:
+            datasets[zoom] = xr.open_dataset(grid_files[zoom])
+
+        for i, zoom in enumerate(zooms):
+            ds = datasets[zoom]
+            adjc, adjc_mask = icon_get_adjacent_cell_indices(ds)
+            coords = get_coords_as_tensor(ds, grid_type="cell")
+
+            if i == 0:
+                parent_index = None
+            else:
+                parent_index = icon_get_parent_index(
+                    ds,
+                    datasets[zooms[i - 1]],
+                    fine_coords=coords,
+                )
+
+            grid_lvl = {
+                "coords": coords,
+                "adjc": adjc,
+                "adjc_mask": adjc_mask,
+                "zoom": zoom,
+                "parent_index": parent_index,
+            }
+            grids.append(grid_lvl)
+    finally:
+        for ds in datasets.values():
+            ds.close()
+
+    return grids
+
 
 def encode_zooms(
     x_zooms: Dict[int, torch.Tensor],

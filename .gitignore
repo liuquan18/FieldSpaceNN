@@ -135,3 +135,5 @@ dmypy.json
 notebooks/
 wandb/
 fieldspacenn/src/utils/losses.py
+
+/test_data
